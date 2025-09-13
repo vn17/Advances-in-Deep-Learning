@@ -5,7 +5,7 @@ import torch
 from .bignet import BIGNET_DIM, LayerNorm  # noqa: F401
 
 
-def block_quantize_4bit(x: torch.Tensor, group_size: int = 16) -> tuple[torch.Tensor, torch.Tensor]:
+def block_quantize_4bit(x: torch.Tensor, group_size: int = 64) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize the input tensor to 4-bit precision along the last dimension.
     Always quantize group_size value together and store their absolute value first.
@@ -39,7 +39,7 @@ def block_dequantize_4bit(x_quant_4: torch.Tensor, normalization: torch.Tensor) 
 
 
 class Linear4Bit(torch.nn.Module):
-    def __init__(self, in_features: int, out_features: int, bias: bool = True, group_size: int = 16) -> None:
+    def __init__(self, in_features: int, out_features: int, bias: bool = True, group_size: int = 256) -> None:
         super().__init__()
         self._shape = (out_features, in_features)
         self._group_size = group_size
@@ -53,11 +53,14 @@ class Linear4Bit(torch.nn.Module):
         )
         self.register_buffer(
             "weight_norm",
-            torch.zeros(num_groups, 1, dtype=torch.float16),
+            torch.ones(num_groups, 1, dtype=torch.float16),
             persistent=False
         )
 
-        # Register bias as buffer
+        # Learnable per-group bias to correct mean shift
+        self.weight_bias = torch.nn.Parameter(torch.zeros(num_groups, 1, dtype=torch.float32))
+
+        # Register bias for the layer
         if bias:
             self.register_buffer('bias', torch.zeros(out_features, dtype=torch.float32))
         else:
@@ -82,13 +85,19 @@ class Linear4Bit(torch.nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Dequantize weights
-        weight = block_dequantize_4bit(self.weight_q4, self.weight_norm)
-        weight = weight.view(self._shape)
+        weight_deq = block_dequantize_4bit(self.weight_q4, self.weight_norm)
         
-        # Create a view that requires gradients for forward pass
-        weight = weight.detach().requires_grad_(True)
-        
-        return torch.nn.functional.linear(x, weight, self.bias)
+        # Apply learnable per-group bias
+        num_groups = self.weight_bias.size(0)
+        group_size = self._group_size
+        weight_deq = weight_deq.view(-1, group_size) + self.weight_bias
+        weight_deq = weight_deq.view(-1)
+
+        # Reshape and apply STE (straight-through estimator)
+        weight_deq = weight_deq.view(self._shape)
+        weight_ste = weight_deq + (weight_deq.detach() - weight_deq)  # STE
+
+        return torch.nn.functional.linear(x, weight_ste, self.bias)
 
 
 class BigNet4Bit(torch.nn.Module):
@@ -130,5 +139,6 @@ class BigNet4Bit(torch.nn.Module):
 def load(path: Path | None) -> BigNet4Bit:
     net = BigNet4Bit()
     if path is not None:
-        net.load_state_dict(torch.load(path, weights_only=True))
+        state = torch.load(path, weights_only=True)
+        net.load_state_dict(state, strict=False)
     return net
