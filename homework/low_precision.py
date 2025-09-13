@@ -45,11 +45,11 @@ def block_dequantize_4bit(x_quant_4: torch.Tensor, scale: torch.Tensor) -> torch
     x_quant_8[:, ::2] = x_quant_4 & 0xF
     x_quant_8[:, 1::2] = (x_quant_4 >> 4) & 0xF
     
-    # Dequantize: map [0, 15] back to [-1, 1]
-    x_norm = (x_quant_8.to(torch.float32) - 7.5) / 7.5
+    # Dequantize: map [0, 15] back to [0, 1]
+    x_norm = x_quant_8.to(torch.float32) / 15.0
     
-    # Scale back to original range
-    x = x_norm * scale
+    # Map back to original range: reverse of (x + scale) / (2 * scale)
+    x = x_norm * (2 * scale) - scale
     return x.view(-1)
 
 
