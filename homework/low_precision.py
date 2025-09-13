@@ -41,70 +41,66 @@ def block_dequantize_4bit(x_quant_4: torch.Tensor, normalization: torch.Tensor) 
 class Linear4Bit(torch.nn.Module):
     def __init__(self, in_features: int, out_features: int, bias: bool = True, group_size: int = 16) -> None:
         super().__init__()
-        # Let's store all the required information to load the weights from a checkpoint
         self._shape = (out_features, in_features)
         self._group_size = group_size
 
-        # self.register_buffer is used to store the weights in the model, but not as parameters
-        # This makes sure weights are put on the correct device when calling `model.to(device)`.
-        # persistent=False makes sure the buffer is not saved or loaded. The bignet has a parameters
-        # called "weight" that we need to quantize when the model is loaded.
+        # Register buffers for quantized weights
+        num_groups = (out_features * in_features + group_size - 1) // group_size
         self.register_buffer(
             "weight_q4",
-            torch.zeros(out_features * in_features // group_size, group_size // 2, dtype=torch.int8),
-            persistent=False,
+            torch.zeros(num_groups, group_size // 2, dtype=torch.int8),
+            persistent=False
         )
         self.register_buffer(
             "weight_norm",
-            torch.zeros(out_features * in_features // group_size, 1, dtype=torch.float16),
-            persistent=False,
+            torch.zeros(num_groups, 1, dtype=torch.float16),
+            persistent=False
         )
-        # Register a hook to load the weights from a checkpoint. This function reaches deep into
-        # PyTorch internals. It makes sure that Linear4Bit._load_state_dict_pre_hook is called
-        # every time the model is loaded from a checkpoint. We will quantize the weights in that function.
-        self._register_load_state_dict_pre_hook(Linear4Bit._load_state_dict_pre_hook, with_module=True)
-        # Add in an optional bias
-        self.bias = None
+
+        # Register bias as buffer
         if bias:
-            self.bias = torch.nn.Parameter(torch.zeros(out_features, dtype=torch.float32))
+            self.register_buffer('bias', torch.zeros(out_features, dtype=torch.float32))
+        else:
+            self.register_buffer('bias', None)
+
+        self._register_load_state_dict_pre_hook(Linear4Bit._load_state_dict_pre_hook, with_module=True)
 
     def _load_state_dict_pre_hook(
         self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
     ):
         if f"{prefix}weight" in state_dict:
-            # Load the original weights and remove them from the state_dict (mark them as loaded)
             weight = state_dict[f"{prefix}weight"]
             del state_dict[f"{prefix}weight"]
 
-            # Quantize the weights and store them in self.weight_q4 and self.weight_norm
-            weight = weight.view(-1)  # Flatten the weight tensor
+            # Quantize weights
+            weight = weight.view(-1)
             weight_q4, weight_norm = block_quantize_4bit(weight, group_size=self._group_size)
+            
+            # Store quantized weights
             self.weight_q4.copy_(weight_q4)
             self.weight_norm.copy_(weight_norm)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Dequantize weights and call the layer
+        # Dequantize weights
         weight = block_dequantize_4bit(self.weight_q4, self.weight_norm)
-        weight = weight.view(self._shape)  # Reshape to original weight shape
+        weight = weight.view(self._shape)
+        
+        # Create a view that requires gradients for forward pass
+        weight = weight.detach().requires_grad_(True)
+        
         return torch.nn.functional.linear(x, weight, self.bias)
 
 
 class BigNet4Bit(torch.nn.Module):
-    """
-    A BigNet where all weights are in 4bit precision. Use the Linear4Bit module for this.
-    It is fine to keep all computation in float32.
-    """
-
     class Block(torch.nn.Module):
-        def __init__(self, channels):
+        def __init__(self, channels: int):
             super().__init__()
-            # Replace torch.nn.Linear with Linear4Bit
             self.model = torch.nn.Sequential(
-                torch.nn.Linear(channels, channels),
-                torch.nn.ReLU(),
-                torch.nn.Linear(channels, channels),
-                torch.nn.ReLU(),
-                torch.nn.Linear(channels, channels),
+                Linear4Bit(channels, channels),  # model.0
+                torch.nn.GELU(),                # model.1
+                Linear4Bit(channels, channels),  # model.2
+                torch.nn.GELU(),                # model.3
+                Linear4Bit(channels, channels),  # model.4
             )
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -112,19 +108,19 @@ class BigNet4Bit(torch.nn.Module):
 
     def __init__(self):
         super().__init__()
-        # Define the BigNet4Bit architecture
+        # Six blocks with five LayerNorms between them
         self.model = torch.nn.Sequential(
-            self.Block(BIGNET_DIM),
-            LayerNorm(BIGNET_DIM),
-            self.Block(BIGNET_DIM),
-            LayerNorm(BIGNET_DIM),
-            self.Block(BIGNET_DIM),
-            LayerNorm(BIGNET_DIM),
-            self.Block(BIGNET_DIM),
-            LayerNorm(BIGNET_DIM),
-            self.Block(BIGNET_DIM),
-            LayerNorm(BIGNET_DIM),
-            self.Block(BIGNET_DIM),
+            self.Block(BIGNET_DIM),      # model.0
+            LayerNorm(BIGNET_DIM),       # model.1
+            self.Block(BIGNET_DIM),      # model.2
+            LayerNorm(BIGNET_DIM),       # model.3
+            self.Block(BIGNET_DIM),      # model.4
+            LayerNorm(BIGNET_DIM),       # model.5
+            self.Block(BIGNET_DIM),      # model.6
+            LayerNorm(BIGNET_DIM),       # model.7
+            self.Block(BIGNET_DIM),      # model.8
+            LayerNorm(BIGNET_DIM),       # model.9
+            self.Block(BIGNET_DIM),      # model.10
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
