@@ -16,25 +16,40 @@ def block_quantize_4bit(x: torch.Tensor, group_size: int = 64) -> tuple[torch.Te
     assert x.size(0) % group_size == 0
 
     x = x.view(-1, group_size)
-    normalization = x.abs().max(dim=-1, keepdim=True).values
-    x_norm = (x + normalization) / (2 * normalization)
-    x_quant_8 = (x_norm * 15).round().to(torch.int8)
+    
+    # Use max absolute value for better range utilization
+    scale = x.abs().max(dim=-1, keepdim=True).values
+    scale = torch.clamp(scale, min=1e-8)  # Prevent division by zero
+    
+    # Normalize to [-1, 1] range
+    x_norm = x / scale
+    
+    # Quantize to 4-bit: map [-1, 1] to [0, 15]
+    x_quant_8 = torch.clamp((x_norm * 7.5 + 7.5).round(), 0, 15).to(torch.int8)
+    
+    # Pack two 4-bit values into one 8-bit value
     x_quant_4 = (x_quant_8[:, ::2] & 0xF) + ((x_quant_8[:, 1::2] & 0xF) << 4)
-    return x_quant_4, normalization.to(torch.float16)
+    return x_quant_4, scale.to(torch.float16)
 
 
-def block_dequantize_4bit(x_quant_4: torch.Tensor, normalization: torch.Tensor) -> torch.Tensor:
+def block_dequantize_4bit(x_quant_4: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """
     The reverse operation of block_quantize_4bit.
     """
     assert x_quant_4.dim() == 2
 
-    normalization = normalization.to(torch.float32)
-    x_quant_8 = x_quant_4.new_empty(x_quant_4.size(0), x_quant_4.shape[1] * 2)
+    scale = scale.to(torch.float32)
+    
+    # Unpack 4-bit values
+    x_quant_8 = x_quant_4.new_empty(x_quant_4.size(0), x_quant_4.shape[1] * 2, dtype=torch.int8)
     x_quant_8[:, ::2] = x_quant_4 & 0xF
     x_quant_8[:, 1::2] = (x_quant_4 >> 4) & 0xF
-    x_norm = x_quant_8.to(torch.float32) / 15
-    x = (x_norm * 2 * normalization) - normalization
+    
+    # Dequantize: map [0, 15] back to [-1, 1]
+    x_norm = (x_quant_8.to(torch.float32) - 7.5) / 7.5
+    
+    # Scale back to original range
+    x = x_norm * scale
     return x.view(-1)
 
 
@@ -52,15 +67,12 @@ class Linear4Bit(torch.nn.Module):
             persistent=False
         )
         self.register_buffer(
-            "weight_norm",
+            "weight_scale",
             torch.ones(num_groups, 1, dtype=torch.float16),
             persistent=False
         )
 
-        # Learnable per-group bias to correct mean shift
-        self.weight_bias = torch.nn.Parameter(torch.zeros(num_groups, 1, dtype=torch.float32))
-
-        # Register bias for the layer
+        # Register bias for the layer (no learnable quantization bias)
         if bias:
             self.register_buffer('bias', torch.zeros(out_features, dtype=torch.float32))
         else:
@@ -77,27 +89,18 @@ class Linear4Bit(torch.nn.Module):
 
             # Quantize weights
             weight = weight.view(-1)
-            weight_q4, weight_norm = block_quantize_4bit(weight, group_size=self._group_size)
+            weight_q4, weight_scale = block_quantize_4bit(weight, group_size=self._group_size)
             
             # Store quantized weights
             self.weight_q4.copy_(weight_q4)
-            self.weight_norm.copy_(weight_norm)
+            self.weight_scale.copy_(weight_scale)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Dequantize weights
-        weight_deq = block_dequantize_4bit(self.weight_q4, self.weight_norm)
-        
-        # Apply learnable per-group bias
-        num_groups = self.weight_bias.size(0)
-        group_size = self._group_size
-        weight_deq = weight_deq.view(-1, group_size) + self.weight_bias
-        weight_deq = weight_deq.view(-1)
-
-        # Reshape and apply STE (straight-through estimator)
+        weight_deq = block_dequantize_4bit(self.weight_q4, self.weight_scale)
         weight_deq = weight_deq.view(self._shape)
-        weight_ste = weight_deq + (weight_deq.detach() - weight_deq)  # STE
 
-        return torch.nn.functional.linear(x, weight_ste, self.bias)
+        return torch.nn.functional.linear(x, weight_deq, self.bias)
 
 
 class BigNet4Bit(torch.nn.Module):
