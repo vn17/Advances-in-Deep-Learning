@@ -56,8 +56,9 @@ class LoraBigNet(torch.nn.Module):
             super().__init__()
             self.model = torch.nn.Sequential(
                 LoRALinear(channels, channels, lora_dim),
-                LayerNorm(channels),
-                torch.nn.GELU(),
+                torch.nn.ReLU(),
+                LoRALinear(channels, channels, lora_dim),
+                torch.nn.ReLU(),
                 LoRALinear(channels, channels, lora_dim),
             )
 
@@ -68,10 +69,15 @@ class LoraBigNet(torch.nn.Module):
         super().__init__()
         self.model = torch.nn.Sequential(
             self.Block(BIGNET_DIM, lora_dim),
+            LayerNorm(BIGNET_DIM),
             self.Block(BIGNET_DIM, lora_dim),
+            LayerNorm(BIGNET_DIM),
             self.Block(BIGNET_DIM, lora_dim),
+            LayerNorm(BIGNET_DIM),
             self.Block(BIGNET_DIM, lora_dim),
+            LayerNorm(BIGNET_DIM),
             self.Block(BIGNET_DIM, lora_dim),
+            LayerNorm(BIGNET_DIM),
             self.Block(BIGNET_DIM, lora_dim),
         )
 
