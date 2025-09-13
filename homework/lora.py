@@ -20,63 +20,59 @@ class LoRALinear(HalfLinear):
     ) -> None:
         """
         Implement the LoRALinear layer as described in the homework
-
-        Hint: You can use the HalfLinear class as a parent class (it makes load_state_dict easier, names match)
-        Hint: Remember to initialize the weights of the lora layers
-        Hint: Make sure the linear layers are not trainable, but the LoRA layers are
         """
         super().__init__(in_features, out_features, bias)
-
-        # Initialize LoRA layers
-        self.lora_a = torch.nn.Linear(in_features, lora_dim, bias=False, dtype=torch.float32)
-        self.lora_b = torch.nn.Linear(lora_dim, out_features, bias=False, dtype=torch.float32)
-
-        # Initialize LoRA weights
-        torch.nn.init.kaiming_uniform_(self.lora_a.weight, a=math.sqrt(5))
-        torch.nn.init.zeros_(self.lora_b.weight)
-
-        # Freeze the base HalfLinear weights
-        self.weight.requires_grad = False
+        
+        # Initialize LoRA layers with no bias
+        self.lora_a = torch.nn.Linear(in_features, lora_dim, bias=False)
+        self.lora_b = torch.nn.Linear(lora_dim, out_features, bias=False)
+        
+        # Initialize lora_a with small random values and lora_b with zeros
+        with torch.no_grad():
+            # Scale initialization by 1/sqrt(lora_dim)
+            scale = 1.0 / math.sqrt(lora_dim)
+            torch.nn.init.normal_(self.lora_a.weight, mean=0.0, std=scale)
+            torch.nn.init.zeros_(self.lora_b.weight)
+        
+        # Freeze base weights
+        self.weight.requires_grad_(False)
         if self.bias is not None:
-            self.bias.requires_grad = False
+            self.bias.requires_grad_(False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Cast input to float32 for LoRA layers
-        x_fp32 = x.to(torch.float32)
-
-        # Compute base HalfLinear output
-        base_output = super().forward(x_fp32)
-
-        # Compute LoRA output
-        lora_output = self.lora_b(self.lora_a(x_fp32))
-
-        # Combine base output and LoRA output, and cast back to input dtype
-        return (base_output + lora_output).to(x.dtype)
+        # Get base output using parent's forward
+        base_out = super().forward(x)
+        
+        # Compute LoRA path in float32
+        lora_out = self.lora_b(self.lora_a(x.to(torch.float32)))
+        
+        # Scale LoRA output by 0.1 before adding
+        return base_out + (0.1 * lora_out.to(base_out.dtype))
 
 
 class LoraBigNet(torch.nn.Module):
     class Block(torch.nn.Module):
         def __init__(self, channels: int, lora_dim: int):
             super().__init__()
-            # Replace HalfLinear with LoRALinear and add LayerNorm
             self.model = torch.nn.Sequential(
                 LoRALinear(channels, channels, lora_dim),
-                LayerNorm(channels),  # LayerNorm should remain in full precision
+                LayerNorm(channels),
                 torch.nn.GELU(),
                 LoRALinear(channels, channels, lora_dim),
             )
 
         def forward(self, x: torch.Tensor):
-            # Residual connection
             return self.model(x) + x
 
     def __init__(self, lora_dim: int = 32):
         super().__init__()
-        # Define the LoraBigNet architecture
         self.model = torch.nn.Sequential(
-            LoraBigNet.Block(BIGNET_DIM, lora_dim),
-            LoraBigNet.Block(BIGNET_DIM, lora_dim),
-            LoraBigNet.Block(BIGNET_DIM, lora_dim),
+            self.Block(BIGNET_DIM, lora_dim),
+            self.Block(BIGNET_DIM, lora_dim),
+            self.Block(BIGNET_DIM, lora_dim),
+            self.Block(BIGNET_DIM, lora_dim),
+            self.Block(BIGNET_DIM, lora_dim),
+            self.Block(BIGNET_DIM, lora_dim),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
