@@ -5,7 +5,7 @@ import torch
 from .bignet import BIGNET_DIM, LayerNorm
 
 
-def block_quantize_4bit(x: torch.Tensor, group_size: int = 8192) -> tuple[torch.Tensor, torch.Tensor]:
+def block_quantize_4bit(x: torch.Tensor, group_size: int = 1048576) -> tuple[torch.Tensor, torch.Tensor]:
     assert x.dim() == 1
     assert x.size(0) % group_size == 0
 
@@ -31,7 +31,7 @@ def block_dequantize_4bit(x_quant_4: torch.Tensor, normalization: torch.Tensor) 
 
 
 class Linear4Bit(torch.nn.Module):
-    def __init__(self, in_features: int, out_features: int, bias: bool = True, group_size: int = 8192) -> None:
+    def __init__(self, in_features: int, out_features: int, bias: bool = True, group_size: int = 1048576) -> None:
         super().__init__()
         self._shape = (out_features, in_features)
         self._group_size = group_size
@@ -106,12 +106,12 @@ class BigNet4Bit(torch.nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.to(torch.float16)
+        x = x.to(torch.float16, copy=False)
         return self.model(x)
 
 
 def load(path: Path | None) -> BigNet4Bit:
     net = BigNet4Bit()
     if path is not None:
-        net.load_state_dict(torch.load(path, weights_only=True), strict=False)
+        net.load_state_dict(torch.load(path, weights_only=True))
     return net
