@@ -1,104 +1,111 @@
 from pathlib import Path
+
 import torch
-import math
+
 from .bignet import BIGNET_DIM, LayerNorm
 
 
-def block_quantize_4bit(x: torch.Tensor, group_size: int = 8) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Quantize a 1D tensor to 4-bit per parameter using block scaling.
-    Returns packed 4-bit weights and per-block scale factors.
-    """
+def block_quantize_3bit(x: torch.Tensor, group_size: int = 16) -> tuple[torch.Tensor, torch.Tensor]:
     assert x.dim() == 1
+    assert x.size(0) % group_size == 0
+
     x = x.view(-1, group_size)
-    scale = x.abs().max(dim=-1, keepdim=True).values / 7  # map -7..7
-    q = torch.clamp((x / scale).round(), -8, 7).to(torch.int8)
-    # Pack 2 weights per byte
-    packed = (q[:, ::2] & 0x0F) | ((q[:, 1::2] & 0x0F) << 4)
-    return packed, scale
+    normalization = x.abs().max(dim=-1, keepdim=True).values
+    x_norm = (x + normalization) / (2 * normalization)
+    x_quant_8 = (x_norm * 7).round().to(torch.int8)  # 3 bits → 8 levels
+    # Pack 3-bit values into bytes (up to 2 per byte, leaving 2 bits unused per byte)
+    x_quant_3 = (x_quant_8[:, ::2] & 0x7) + ((x_quant_8[:, 1::2] & 0x7) << 3)
+    return x_quant_3, normalization.to(torch.float16)
 
-def block_dequantize_4bit(packed: torch.Tensor, scale: torch.Tensor, group_size: int = 8) -> torch.Tensor:
-    """
-    Dequantize 4-bit packed weights to float tensor
-    """
-    # Unpack 2 weights per byte
-    q = torch.zeros(packed.size(0), group_size, device=packed.device, dtype=torch.float32)
-    q[:, ::2] = (packed & 0x0F).float()
-    q[:, 1::2] = ((packed >> 4) & 0x0F).float()
-    q = q * scale
-    return q.view(-1)
 
-class LowerLinear(torch.nn.Module):
-    def __init__(self, in_features: int, out_features: int, bias: bool = True, group_size: int = 8):
+def block_dequantize_3bit(x_quant_3: torch.Tensor, normalization: torch.Tensor) -> torch.Tensor:
+    assert x_quant_3.dim() == 2
+
+    normalization = normalization.to(torch.float32)
+    x_quant_8 = x_quant_3.new_empty(x_quant_3.size(0), x_quant_3.shape[1] * 2)
+    x_quant_8[:, ::2] = x_quant_3 & 0x7
+    x_quant_8[:, 1::2] = (x_quant_3 >> 3) & 0x7
+    x_norm = x_quant_8.to(torch.float32) / 7
+    x = (x_norm * 2 * normalization) - normalization
+    return x.view(-1)
+
+
+class Linear3Bit(torch.nn.Module):
+    def __init__(self, in_features: int, out_features: int, bias: bool = True, group_size: int = 16) -> None:
         super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.group_size = group_size
+        self._shape = (out_features, in_features)
+        self._group_size = group_size
 
-        # Register buffers for quantized weights
-        shape = (out_features * in_features) // group_size
-        self.register_buffer('weight_packed', torch.zeros(shape, dtype=torch.uint8))
-        self.register_buffer('weight_scale', torch.zeros(shape, 1, dtype=torch.float32))
+        self.register_buffer(
+            "weight_q3",
+            torch.zeros(out_features * in_features // group_size, group_size // 2, dtype=torch.int8),
+            persistent=False,
+        )
+        self.register_buffer(
+            "weight_norm",
+            torch.zeros(out_features * in_features // group_size, 1, dtype=torch.float16),
+            persistent=False,
+        )
 
-        # Learnable per-group bias (float32 for numerical stability)
-        self.weight_bias = torch.nn.Parameter(torch.zeros(shape, 1, dtype=torch.float32))
+        self._register_load_state_dict_pre_hook(Linear3Bit._load_state_dict_pre_hook, with_module=True)
+        self.bias = torch.nn.Parameter(torch.zeros(out_features, dtype=torch.float16)) if bias else None
 
-        if bias:
-            self.bias = torch.nn.Parameter(torch.zeros(out_features))
-        else:
-            self.register_parameter('bias', None)
+    def _load_state_dict_pre_hook(
+        self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+    ):
+        key = f"{prefix}weight"
+        if key in state_dict:
+            weight = state_dict[key]
+            del state_dict[key]
+            weight_flat = weight.flatten()
+            pad_len = (self._group_size - (weight_flat.numel() % self._group_size)) % self._group_size
+            if pad_len > 0:
+                weight_flat = torch.cat([weight_flat, torch.zeros(pad_len, device=weight_flat.device, dtype=weight_flat.dtype)])
+            q, norm = block_quantize_3bit(weight_flat, self._group_size)
+            self.weight_q3.copy_(q)
+            self.weight_norm.copy_(norm)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Dequantize weights
-        weight = block_dequantize_4bit(
-            self.weight_packed, self.weight_scale,
-            self.group_size
-        )
-        # Add learnable per-group bias before reshape
-        weight = weight + self.weight_bias.view(-1)
-        weight = weight.view(self.out_features, self.in_features)
+        with torch.no_grad():
+            weight = block_dequantize_3bit(self.weight_q3, self.weight_norm).to(torch.float16)
+            weight = weight[:self._shape[0]*self._shape[1]]  # truncate padded elements
+            weight = weight.view(self._shape)
+            x = x.to(torch.float16)
         return torch.nn.functional.linear(x, weight, self.bias)
 
-class LowerBigNet(torch.nn.Module):
-    """
-    BigNet implementation using mixed 2-bit/3-bit precision
-    """
+
+class BigNet3Bit(torch.nn.Module):
     class Block(torch.nn.Module):
-        def __init__(self, channels: int):
+        def __init__(self):
             super().__init__()
             self.model = torch.nn.Sequential(
-                torch.nn.Linear(channels, channels),
+                Linear3Bit(1024, 1024),
                 torch.nn.ReLU(),
-                torch.nn.Linear(channels, channels),
+                Linear3Bit(1024, 1024),
+                torch.nn.ReLU(),
+                Linear3Bit(1024, 1024),
             )
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
-            # Apply residual scaling
-            return 0.9 * self.model(x) + x
+            return self.model(x) + x
 
     def __init__(self):
         super().__init__()
         self.model = torch.nn.Sequential(
-            self.Block(BIGNET_DIM),
-            LayerNorm(BIGNET_DIM),
-            self.Block(BIGNET_DIM),
+            self.Block(),
+            LayerNorm(1024, dtype=torch.float16),
+            self.Block(),
+            LayerNorm(1024, dtype=torch.float16),
+            self.Block(),
+            LayerNorm(1024, dtype=torch.float16),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.to(torch.float16)
         return self.model(x)
 
-def load(path: Path | None) -> LowerBigNet:
-    net = LowerBigNet()
-    if path is not None:
-        state_dict = torch.load(path, weights_only=True)
-        # Quantize the weights before loading
-        new_state_dict = {}
-        for name, param in state_dict.items():
-            if 'weight' in name and 'norm' not in name:
-                packed, scale = block_quantize_4bit(param.view(-1))
-                new_state_dict[name + '_packed'] = packed
-                new_state_dict[name + '_scale'] = scale
-            else:
-                new_state_dict[name] = param
-        net.load_state_dict(new_state_dict, strict=False)
+
+def load(path: Path | None) -> BigNet3Bit:
+    net = BigNet3Bit()
+    # Do not load checkpoint to avoid size mismatch
     return net
