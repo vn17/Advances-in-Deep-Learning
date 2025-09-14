@@ -80,9 +80,9 @@ class BigNet4Bit(torch.nn.Module):
             super().__init__()
             self.model = torch.nn.Sequential(
                 Linear4Bit(1024, 1024),
-                torch.nn.ReLU(),
+                torch.nn.ReLU(inplace=True),
                 Linear4Bit(1024, 1024),
-                torch.nn.ReLU(),
+                torch.nn.ReLU(inplace=True),
                 Linear4Bit(1024, 1024),
             )
 
