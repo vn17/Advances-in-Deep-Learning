@@ -6,28 +6,22 @@ from .bignet import BIGNET_DIM, LayerNorm
 
 
 def block_quantize_4bit(x: torch.Tensor, group_size: int = 1048576) -> tuple[torch.Tensor, torch.Tensor]:
+    x = x.to(torch.float16)
     assert x.dim() == 1
     assert x.size(0) % group_size == 0
 
     x = x.view(-1, group_size)
     normalization = x.abs().max(dim=-1, keepdim=True).values
-    x_norm = (x + normalization) / (2 * normalization)
+    x_norm = x
+    x_norm.add_(normalization)           # in-place addition
+    x_norm.div_(2 * normalization)       # in-place division
     x_quant_16 = (x_norm * 15).round().to(torch.int8)  # 4 bits → 16 levels
     # Pack 4-bit values into bytes (2 per byte)
     x_quant_4 = (x_quant_16[:, ::2] & 0xF) + ((x_quant_16[:, 1::2] & 0xF) << 4)
-    return x_quant_4, normalization.to(torch.float16)
+    return x_quant_4, normalization
 
 
-def block_dequantize_4bit(x_quant_4: torch.Tensor, normalization: torch.Tensor) -> torch.Tensor:
-    assert x_quant_4.dim() == 2
 
-    normalization = normalization.to(torch.float16)
-    x_quant_16 = x_quant_4.new_empty(x_quant_4.size(0), x_quant_4.shape[1] * 2)
-    x_quant_16[:, ::2] = x_quant_4 & 0xF
-    x_quant_16[:, 1::2] = (x_quant_4 >> 4) & 0xF
-    x_norm = x_quant_16.to(torch.float16) / 15
-    x = (x_norm * 2 * normalization) - normalization
-    return x.view(-1)
 
 
 class Linear4Bit(torch.nn.Module):
@@ -46,6 +40,8 @@ class Linear4Bit(torch.nn.Module):
             torch.zeros(out_features * in_features // group_size, 1, dtype=torch.float16),
             persistent=False,
         )
+        # Preallocate a temporary buffer for dequantization
+        self.register_buffer("_tmp_dequant", torch.empty(0, dtype=torch.int8), persistent=False)
 
         self._register_load_state_dict_pre_hook(Linear4Bit._load_state_dict_pre_hook, with_module=True)
         self.bias = torch.nn.Parameter(torch.zeros(out_features, dtype=torch.float16)) if bias else None
@@ -67,10 +63,17 @@ class Linear4Bit(torch.nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
-            weight = block_dequantize_4bit(self.weight_q4, self.weight_norm).to(torch.float16)
-            weight = weight[:self._shape[0]*self._shape[1]]  # truncate padded elements
-            weight = weight.view(self._shape)
-            x = x.to(torch.float16)
+            # reuse tmp buffer for dequantization, no extra allocations
+            needed_numel = self.weight_q4.size(0) * self.weight_q4.size(1) * 2
+            if self._tmp_dequant.numel() < needed_numel:
+                self._tmp_dequant.resize_(self.weight_q4.size(0), self.weight_q4.size(1) * 2)
+            x_quant_16 = self._tmp_dequant[:self.weight_q4.size(0), :self.weight_q4.size(1)*2]
+            x_quant_16[:, ::2] = self.weight_q4 & 0xF
+            x_quant_16[:, 1::2] = (self.weight_q4 >> 4) & 0xF
+            x_norm = x_quant_16.to(torch.float16) / 15
+            weight = (x_norm * 2 * self.weight_norm.view(-1,1)) - self.weight_norm.view(-1,1)
+            weight = weight[:self._shape[0]*self._shape[1]].view(self._shape)
+            # assume x is already float16 from BigNet4Bit.forward
         return torch.nn.functional.linear(x, weight, self.bias)
 
 
