@@ -98,6 +98,9 @@ class BigNet3Bit(torch.nn.Module):
             LayerNorm(1024, dtype=torch.float16),
             self.Block(),
             LayerNorm(1024, dtype=torch.float16),
+            self.Block(),
+            LayerNorm(1024, dtype=torch.float16),
+            self.Block(),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -107,5 +110,6 @@ class BigNet3Bit(torch.nn.Module):
 
 def load(path: Path | None) -> BigNet3Bit:
     net = BigNet3Bit()
-    # Do not load checkpoint to avoid size mismatch
+    if path is not None:
+        net.load_state_dict(torch.load(path, weights_only=True), strict=False)
     return net
