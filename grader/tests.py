@@ -336,10 +336,10 @@ class ExtraCreditGrader(Grader):
 
         bigmodel = self.load_model("bignet").to(self.device)
         max_diff, mean_diff = compare_model_forward(bigmodel, lower_model, self.device)
-        assert mean_diff < self.MEAN_DIFF_BOUND, f"Mean difference is too high: {mean_diff:.4f}"
+        assert mean_diff < self.MEAN_DIFF_BOUND, f"Mean difference is too high: {mean_diff:.4f}, memory: {stats.actual_memory:.4f}"
         assert max_diff < self.MAX_DIFF_BOUND, f"Max difference is too high: {max_diff:.4f}"
 
-        assert stats.actual_memory < self.TOTAL_MEMORY_BOUND, f"Actual memory is too high: {stats.actual_memory:.4f}"
+        assert stats.actual_memory < self.TOTAL_MEMORY_BOUND, f"Actual memory is too high: {stats.actual_memory:.4f}, mean_diff: {mean_diff:.4f}"
         assert (
             stats.theoretical_memory < self.TOTAL_MEMORY_BOUND
         ), f"Theoretical memory is too high: {stats.theoretical_memory:.4f}"

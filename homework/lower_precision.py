@@ -73,7 +73,6 @@ class Linear4Bit(torch.nn.Module):
             x_norm = x_quant_16.to(torch.float16) / 15
             weight = (x_norm * 2 * self.weight_norm.view(-1,1)) - self.weight_norm.view(-1,1)
             weight = weight[:self._shape[0]*self._shape[1]].view(self._shape)
-            # assume x is already float16 from BigNet4Bit.forward
         return torch.nn.functional.linear(x, weight, self.bias)
 
 
