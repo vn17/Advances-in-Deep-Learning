@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import torch
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 from .bignet import BIGNET_DIM, LayerNorm  # noqa: F401
 
@@ -18,19 +19,19 @@ class HalfLinear(torch.nn.Linear):
         Feel free to set self.requires_grad_ to False, we will not backpropagate through this layer.
         """
         super().__init__(in_features, out_features, bias)
-        # Cast weights and biases to half precision (float16)
-        self.weight.data = self.weight.data.half()
+        # Cast weights and biases to half precision (float16) and move to DEVICE
+        self.weight.data = self.weight.data.half().to(DEVICE)
         if self.bias is not None:
-            self.bias.data = self.bias.data.half()
+            self.bias.data = self.bias.data.half().to(DEVICE)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Hint: Use the .to method to cast a tensor to a different dtype (i.e. torch.float16 or x.dtype)
         # The input and output should be of x.dtype = torch.float32
-        x = x.to(torch.float32)  # Ensure input is in float32
+        x = x.to(torch.float32).to(next(self.parameters()).device)  # Ensure input is in float32 and on correct device
         output = torch.nn.functional.linear(
             x.to(torch.float16), self.weight, self.bias
         )  # Perform computation in float16
-        return output.to(torch.float32)  # Cast output back to float32
+        return output.to(torch.float32).to(x.device)  # Cast output back to float32 and move to input device
 
 
 class HalfBigNet(torch.nn.Module):
@@ -44,12 +45,12 @@ class HalfBigNet(torch.nn.Module):
             super().__init__()
             # TODO: Implement me (feel free to copy and reuse code from bignet.py)
             self.model = torch.nn.Sequential(
-                HalfLinear(channels, channels),
+                HalfLinear(channels, channels).to(DEVICE),
                 torch.nn.ReLU(),
-                HalfLinear(channels, channels),
+                HalfLinear(channels, channels).to(DEVICE),
                 torch.nn.ReLU(),
-                HalfLinear(channels, channels),
-            )
+                HalfLinear(channels, channels).to(DEVICE),
+            ).to(DEVICE)
 
         def forward(self, x: torch.Tensor):
             return self.model(x) + x
@@ -58,18 +59,18 @@ class HalfBigNet(torch.nn.Module):
         super().__init__()
         # TODO: Implement me (feel free to copy and reuse code from bignet.py)
         self.model = torch.nn.Sequential(
-            self.Block(BIGNET_DIM),
-            LayerNorm(BIGNET_DIM),
-            self.Block(BIGNET_DIM),
-            LayerNorm(BIGNET_DIM),
-            self.Block(BIGNET_DIM),
-            LayerNorm(BIGNET_DIM),
-            self.Block(BIGNET_DIM),
-            LayerNorm(BIGNET_DIM),
-            self.Block(BIGNET_DIM),
-            LayerNorm(BIGNET_DIM),
-            self.Block(BIGNET_DIM),
-        )
+            self.Block(BIGNET_DIM).to(DEVICE),
+            LayerNorm(BIGNET_DIM).to(DEVICE),
+            self.Block(BIGNET_DIM).to(DEVICE),
+            LayerNorm(BIGNET_DIM).to(DEVICE),
+            self.Block(BIGNET_DIM).to(DEVICE),
+            LayerNorm(BIGNET_DIM).to(DEVICE),
+            self.Block(BIGNET_DIM).to(DEVICE),
+            LayerNorm(BIGNET_DIM).to(DEVICE),
+            self.Block(BIGNET_DIM).to(DEVICE),
+            LayerNorm(BIGNET_DIM).to(DEVICE),
+            self.Block(BIGNET_DIM).to(DEVICE),
+        ).to(DEVICE)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.model(x)
@@ -78,7 +79,7 @@ class HalfBigNet(torch.nn.Module):
 def load(path: Path | None) -> HalfBigNet:
     # You should not need to change anything here
     # PyTorch can load float32 states into float16 models
-    net = HalfBigNet()
+    net = HalfBigNet().to(DEVICE)
     if path is not None:
-        net.load_state_dict(torch.load(path, weights_only=True))
+        net.load_state_dict(torch.load(path, map_location=DEVICE, weights_only=True))
     return net

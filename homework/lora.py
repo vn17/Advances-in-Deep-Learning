@@ -2,6 +2,7 @@ from pathlib import Path
 
 import math
 import torch
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 from .bignet import BIGNET_DIM, LayerNorm  # noqa: F401
 from .half_precision import HalfLinear
@@ -24,8 +25,8 @@ class LoRALinear(HalfLinear):
         super().__init__(in_features, out_features, bias)
         
         # Initialize LoRA layers with no bias
-        self.lora_a = torch.nn.Linear(in_features, lora_dim, bias=False)
-        self.lora_b = torch.nn.Linear(lora_dim, out_features, bias=False)
+        self.lora_a = torch.nn.Linear(in_features, lora_dim, bias=False).to(DEVICE)
+        self.lora_b = torch.nn.Linear(lora_dim, out_features, bias=False).to(DEVICE)
         
         # Initialize lora_a with small random values and lora_b with zeros
         with torch.no_grad():
@@ -33,6 +34,9 @@ class LoRALinear(HalfLinear):
             scale = 1.0 / math.sqrt(lora_dim)
             torch.nn.init.normal_(self.lora_a.weight, mean=0.0, std=scale)
             torch.nn.init.zeros_(self.lora_b.weight)
+            # Move initialized weights to DEVICE
+            self.lora_a.weight.data = self.lora_a.weight.data.to(DEVICE)
+            self.lora_b.weight.data = self.lora_b.weight.data.to(DEVICE)
         
         # Freeze base weights
         self.weight.requires_grad_(False)
@@ -40,14 +44,15 @@ class LoRALinear(HalfLinear):
             self.bias.requires_grad_(False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        device = x.device
         # Get base output using parent's forward
         base_out = super().forward(x)
         
-        # Compute LoRA path in float32
-        lora_out = self.lora_b(self.lora_a(x.to(torch.float32)))
+        # Compute LoRA path in float32 on same device
+        lora_out = self.lora_b(self.lora_a(x.to(torch.float32).to(device)))
         
         # Scale LoRA output by 0.1 before adding
-        return base_out + (0.1 * lora_out.to(base_out.dtype))
+        return base_out + (0.1 * lora_out.to(base_out.dtype).to(device))
 
 
 class LoraBigNet(torch.nn.Module):
