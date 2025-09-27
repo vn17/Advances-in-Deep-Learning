@@ -14,13 +14,13 @@ def block_quantize_4bit(x: torch.Tensor, group_size: int = 16) -> tuple[torch.Te
     x_norm = (x + normalization) / (2 * normalization)
     x_quant_8 = (x_norm * 15).round().to(torch.int8)
     x_quant_4 = (x_quant_8[:, ::2] & 0xF) + ((x_quant_8[:, 1::2] & 0xF) << 4)
-    return x_quant_4, normalization.to(torch.float16)
+    return x_quant_4, normalization.to(dtype=torch.float16, device=x.device)
 
 
 def block_dequantize_4bit(x_quant_4: torch.Tensor, normalization: torch.Tensor) -> torch.Tensor:
     assert x_quant_4.dim() == 2
 
-    normalization = normalization.to(torch.float32)
+    normalization = normalization.to(dtype=torch.float32, device=x_quant_4.device)
     x_quant_8 = x_quant_4.new_empty(x_quant_4.size(0), x_quant_4.shape[1] * 2)
     x_quant_8[:, ::2] = x_quant_4 & 0xF
     x_quant_8[:, 1::2] = (x_quant_4 >> 4) & 0xF
