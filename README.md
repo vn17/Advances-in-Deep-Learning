@@ -1,175 +1,207 @@
-# Homework 1 - Low memory training and inference
+# Homework 2 - Auto-regressive image generation
 
-In this homework, we will start with a large deep network `BigNet`. To keep things simple we keep it at 73MB.
+In this homework, we will train an auto-regressive image generation model from scratch on a dataset up supertuxkart images [here](https://utexas.box.com/shared/static/qubjm5isldqvyimfj9rsmbnvnbezwcv4.zip).
+The final model is both a generative model, and an image compressor.
 
-First, familiarize yourself with `BigNet` (see `homework/bignet.py`). You should see:
+The homework consists of five parts (one optional):
 
-- Layer definitions
-- The main network `BigNet`
-- A `load` function
+1. Train a patch-level auto-encoder `ae.py`
+2. Convert your auto-encoder into a quantizer `bsq.py` using Binary Spherical Quantization
+3. Convert the training and validation sets into their tokenized form and train an auto-regressive model
+4. Generate samples from the auto-regressive model
+5. (Optional) Use the auto-regressive model to compress your images.
 
-If you're curious to see how big `BigNet` actually is call
+Familiarize yourself with the starter code, download and unzip the data.
 
 ```bash
-python3 -m homework.stats bignet
+wget https://utexas.box.com/shared/static/qubjm5isldqvyimfj9rsmbnvnbezwcv4.zip -O supertux_data.zip
+unzip supertux_data.zip
 ```
 
-It should show this (up to rounding errors depending on your PyTorch backend)
+We provide dataloaders for the image dataset, and tokenized versions of the dataset in `data.py`.
+We also provide a full training script including logging in `train.py`.
+To train any model you define in `ae.py`, `autoregressive.py`, or `bsq.py` simply call:
 
-```
- bignet
-Trainable params          18.90 M
-Non-trainable params       0.00 M
-Total params              18.90 M
-Theoretical memory        72.11 MB
-Actual memory             72.11 MB
-Forward memory             8.12 MB
-Backward memory           80.23 MB
+```bash
+python -m homework.train NameOfTheModel
 ```
 
-In this homework, you will implement four additional versions of `BigNet` using various memory-saving techniques:
+Feel free to optionally provide `--epochs ..` (to train for longer) or `--batch_size` (to manage memory).
+The trainer will produce two files/directories:
 
-- Half precision networks (in `homework/half_precision.py`)
-- LoRA with a half-precision base network (in `homework/lora.py`)
-- 4-bit quantized networks (in `homework/low_precision.py`)
-- QLoRA (in `homework/qlora.py`)
+- `logs/{date}_{NameOfTheModel}` a tensorboard log (call `tensorboard --logdir logs` to see all logs)
+- `checkpoints/{date}_{NameOfTheModel}.pth` the actual model trained
 
-For each, you should first define any net layers you might need. It is fine to use PyTorch's built-in layers, but you should not use any external dependencies such as hugging face or torchtune.
+Finally, we provide the tokenization script (`tokenize.py`) that converts a set of images into a torch tensor of tokens.
 
 ## Grading Criteria
 
-We will grade your solution using two criteria: Forward only (for all models), Forward-backward (LoRA and QLoRA).
+The grading criteria are part-specific and explained below.
+There are 5 pts extra credit to implement compression using the auto-regressive model and entropy coding.
 
-### Forward only (80 pts)
+## Patch-level auto-encoder (30 pts)
 
-For each implementation, we will benchmark the total memory used and verify that outputs from your implementation match the original `BigNet` (up to some error tolerance). Each implementation scores up to 20 pts.
+We start by implementing the patch-level auto-encoder.
+The goal here is to take an image of size W=150 x H=100 pixels and split it into equal-sized patches of size PxP (anything from P=5 to P=25 will work here).
+For each patch, we compute a d-dimensional embedding using a non-linear function.
+The result is an image of size w x h x d image of features.
+A decoder then maps these features back into the original image space.
 
-### Forward-backward (20 pts)
+Architecturally almost anything will work here. Use this part of the assignment to get used to the training code, and get warmed up.
+Even a linear encoder and decoder work here.
 
-We will train your LoRA and QLoRA implementation for a few steps to verify that they can fit a certain training objective. Each implementation scores up to 10 pts.
-
-## Half precision (20 pts)
-
-Let's start with `homework/half_precision.py`. Implement a `BigNet` whose weights are stored in half-precision.
-There are at least a dozen different ways to implement this in PyTorch. The starter code nudges you towards a very particular implementation: Redefine a BigNet and replace all `torch.nn.Linear` layers with your implementation of a `HalfLinear` layer.
-
-This takes advantage of several properties of `torch.nn.Modules`. First, if the parameters of this `HalfLinear` layers have the same name as `torch.nn.Linear` then loading and storing parameters from a checkpoint will work out of the box (even if the dtype slightly mismatches `float16` vs `float32`).
-The easiest way to implement `HalfLinear` is to directly inherit from `torch.nn.Linear` and use the right parameters in `super().__init__`.
-
-You have to override the `forward` function of your new `HalfLinear` layer to cast tensor types to match (PyTorch does not like to mix `float16` and `float32` in common operations).
-
-When you're done test your new network:
+Train your network by calling:
 
 ```bash
-python3 -m homework.stats bignet half_precision
+python -m homework.train PatchAutoEncoder
 ```
 
-You should see a 50% decrease in memory use throughout:
+## Patch-level Quantizer (30 pts)
 
-```
- bignet     half_precision
-Trainable params          18.90 M         0.01 M
-Non-trainable params       0.00 M        18.89 M
-Total params              18.90 M        18.90 M
-Theoretical memory        72.11 MB       36.07 MB
-Actual memory             72.11 MB       36.07 MB
-Forward memory             8.12 MB        0.00 MB
-Backward memory           80.23 MB        0.04 MB
-```
+In this part, we implement a simplified version of [Binary Spherical Quantization (BSQ)](https://arxiv.org/abs/2406.07548).
+BSQ uses a binary bottleneck of size C where each feature is either -1 or 1. This binary code directly corresponds to an integer token. See `BSQ._code_to_index` and `BSQ._index_to_code` for functions that map a binary vector to an integer feature.
+We provide a differentiable binarization function `diff_sign` in `bsq.py`. It allows for a -1 / 1 quantization and uses a straight-through gradient estimator.
+Using this function directly in a binary bottleneck likely will not work (see BSQ paper for baselines, or feel free to train it yourself).
+However, simply normalizing the inputs to the binarization using an L2-norm will lead to a fairly easy-to-train and efficient quantizer.
+Finally, BSQ projects auto-encoder features down to a lower-dimensional bottleneck (also called codebook dimension), then normalizes, quantizes, and projects everything back into the original space.
 
-`Trainable params` and `Backward memory` are near zero in our implementation. We disabled back-propagation through the float16 linear layer. It is numerically not very stable.
+BSQ optimizes several losses in addition to reconstruction (entropy, commitment, GAN, etc).
+For this assignment, you can safely ignore all other losses, a simple differentiable sign and normalization should suffice.
 
-You can also compare the outputs of the two models:
+In this part, you should combine your auto-encoder from part 1 with the BSQ quantizer.
+It is highly recommended to follow the hyper-parameters set out in the starter code `patch_size=5` and `codebook_bits = 10`, this will make later parts easier.
+
+Train your network by calling:
 
 ```bash
-python3 -m homework.compare bignet half_precision
+python -m homework.train BSQPatchAutoEncoder
 ```
 
-They should match within a tolerance of 0.002.
+Make sure to fire up tensorboard `tensorboard --logdir logs` to monitor your training.
 
-## LoRA (30 pts)
+A well-trained quantizer will look like this:
 
-Let's start with `homework/lora.py`. We will build on the `HalfBigNet` here, and add a LoRA adapter to all linear layers. There are again several ways to implement this. The easiest is to again modify the network, especially the linear layers, but keep the overall names of layers the same. That way PyTorch will again load all weights for us.
+![](tensorboard.png)
 
-Start by implementing `LoRALinear`. It is fine to inherit from `HalfLinear` and implement the LoRA adapter on top. Make sure to keep the LoRA linear layers at `float32` precision, otherwise they might not train well.
+The above quantizer was trained for an hour in a single GPU.
+It introduces some artifacts, due to limited training, and using just an L2 loss, but anything close to this will suffice for the homework.
+If your quantizer is blocky, or blurry don't worry, you will still be able to complete the assignment. Training a successful quantizer can take as little as 5min on an entry-level GPU.
 
-Use `stats` and `compare` to test your implementation.
+With the `BSQPatchAutoEncoder` trained, let's create a token-level dataset for the next part.
 
 ```bash
-python3 -m homework.stats bignet lora
-python3 -m homework.compare bignet lora
+python -m homework.tokenize checkpoints/YOUR_BSQPatchAutoEncoder.pth data/tokenized_train.pth data/train/*.jpg
+
+python -m homework.tokenize checkpoints/YOUR_BSQPatchAutoEncoder.pth data/tokenized_valid.pth data/valid/*.jpg
 ```
 
-Finally, let's see if your LoRA adapter trains:
+This will create two files `data/tokenized_train.pth` and `data/tokenized_valid.pth` containing the entire training and validation datasets.
+
+If you're curious, check the tokenized checkpoint size:
+
+```
+du -hs data/tokenized_train.pth
+```
+
+If you follow the hyper-parameters above, it should be around 76Mb (compared to 500Mb for the original JPG dataset).
+This is already a great compression result, but we will be able to get it down further.
+
+## Auto-regressive model (30 pts)
+
+Finally, we will train an auto-regressive model.
+It takes a batch of the tokenized image as input and produces a distribution over next tokens as output.
+
+Design your `AutoregressiveModel` in `autoregressive.py`.
+Many models work here, but a decoder-only transformer might be the easiest.
+As with the quantizer above, you will not require a large network to pass this assignment.
+We recommend using `torch.nn.TransformerEncoderLayer` (not a typo) with a causal mask `torch.nn.Transformer.generate_square_subsequent_mask`.
+For this to work, you should flatten your input image into a sequence first.
+You'll need to take care handling the auto-regressive prediction: The output at location (i, j) should not see the input token at location(i, j) which should predict and only see tokens preceding it.
+You may use a positional embedding, but this is optional.
+
+Once your network is ready, train it using the next-token cross-entropy loss.
 
 ```bash
-python3 -m homework.fit lora
+python -m homework.train AutoregressiveModel
 ```
 
-This script fits the model to 1000 samples of random noise half with a label 0, half with a label 1. Since the input dimension is large (1024) and the number of samples is small, this will almost certainly overfit within very few iterations (about 30).
+Fun fact: The cross-entropy corresponds to the compression rate an arithmetic coding algorithm can obtain using your model.
 
-## 4-Bit Quantization (20 pts)
+Your model should be able to reach an average of 4500 bits per image quite easily.
+A well-trained model can go as low as 4000 bits per image (500 bytes, an order of magnitude smaller than JPG, although not at the same quality).
 
-Let's start with `homework/low_precision.py`. Here, we implement 4-bit quantization for weights of all linear layers. We provide you with a very basic PyTorch native 4-bit block quantizer.
-`block_quantize_4bit` takes a 1D `torch.Tensor` and quantizes groups of `group_size` values into 4 bits each.
-The quantization works as follows:
+## Generation (10 pts)
 
-- Given a group of values $v_1 \ldots v_k$
-- Find the largest absolute value $\hat v = \max_i |v_i|$
-- Store $\hat v$ in `float16` (using 16 / k bits per value)
-- Store $(v_i + \hat v) / (2*\hat v)$ as a value from 0 to 15 (using 4-bits per value)
-- Finally, pack two consecutive 4-bit values into a single byte
+Finally, produce samples from your generative model by implementing `AutoregressiveModel.generate`.
+Since our model is quite small, and the tokenizer is lossy, don't expect great generation results.
 
-The output is two tensors `x_quant_4` quantizes values in `int8` format, and `normalization` in `float16` format.
+Here are samples from a model without positional embedding
 
-`block_dequantize_4bit` reverses this process.
+![](gen_nopos_1.png) ![](gen_nopos_2.png) ![](gen_nopos_3.png)
 
-Since PyTorch does not natively support this sort of quantization, the corresponding `Linear4Bit` layer requires some plumbing:
+As you can see, they mostly capture co-occurrence statistics of patches (within a level).
 
-- First, the `weight_q4` and `weight_norm` parameters need to be manually constructed and registered. This gaurantees any `Module.to(device)` function moves the quantized weights on the proper device.
-- Next, the weights in a checkpoint are stored in the `...weight` `state_dict`, but the layer does not have a `weight` parameter. This requires us to override the `load_state_dict` function, which is done through a `_load_state_dict_pre_hook`. A large part of this is implemented in the starter code, including obtaining the weights from the `state_dict` and some bookkeeping. You should implement quantization in the `_load_state_dict_pre_hook`.
-- Finally, the forward function needs to dequantize weights before they can be used in `torch.nn.functional.linear`.
+With a positional embedding, the results look slightly better, but still far from great:
 
-If everything goes well, you should see some massive savings in memory:
+![](gen_pos_1.png) ![](gen_pos_2.png) ![](gen_pos_3.png)
+
+To generate your own samples use
+
+```
+python3 -m homework.generation checkpoints/YOUR_TOKENIZER checkpoints/YOUR_AUTOREGRESSIVE_MODEL N_IMAGES OUTPUT_PATH
+```
+
+If you trained your model for only a few (even one works) epochs, the generations may look like this:
+
+![](gen_one_1.png) ![](gen_one_2.png) ![](gen_one_3.png)
+
+Getting better generations will require:
+
+1. A better Quantizer (smaller patches or higher bitrates)
+2. A much larger transformer
+3. Longer training
+
+## Extra credit: Compression (5 pts)
+
+If you want to challenge yourself, try implementing the `Compressor.compress` and `Compressor.decompress` functions in `compress.py`.
+
+## Checkpoints
+During training, model checkpoints will be automatically saved in the checkpoints/ directory. The latest trained model will also be saved in the homework/ directory and will be used for grading.
+
+If you wish to submit a specific checkpoint instead of the most recent one, you can manually copy the desired checkpoint from checkpoints/ into homework/, overwriting the existing model file. This ensures that the grader evaluates your preferred checkpoint.
+
+For example, if you trained an AutoregressiveModel on 2025-02-27 and want this checkpoint to be graded, run:
 
 ```bash
-python3 -m homework.stats bignet low_precision
+cp checkpoints/2025-02-27_AutoregressiveModel.pth homework/AutoregressiveModel.pth
 ```
 
-This should lead to an almost 7x reduction in memory. Think about why not 8x (float32: 32 bits -> 4 bits)?
+## Apple Silicon (MPS) and Bitwise Operations Bug
 
-```
- bignet     low_precision
-Trainable params          18.90 M         0.03 M
-Non-trainable params       0.00 M        10.62 M
-Total params              18.90 M        10.65 M
-Theoretical memory        72.11 MB       11.36 MB
-Actual memory             72.11 MB       11.36 MB
-Forward memory             8.12 MB        0.00 MB
-Backward memory           80.23 MB        0.04 MB
-```
+During the implementation of Binary Spherical Quantization (BSQ), we encountered a bug related to bitwise operations on Apple Silicon (MPS) in PyTorch. Specifically, bit shifting operations (<< and >>) do not work correctly when executed on an MPS-enabled device.
 
-## Q-LoRA (30 pts)
+This issue is tracked in the PyTorch repository:
+[PyTorch Issue #147889](https://github.com/pytorch/pytorch/issues/147889)
 
-Let's start with `homework/qlora.py`. If you inherit from `Linear4Bit`, `QLoRA` should not be much harder than `LoRA`.
+To work around this issue, we have implemented a custom bitwise operation using the `diff_sign` function. This function provides a differentiable approximation of the sign function, which is equivalent to the bitwise operation in the reference implementation.
 
-## Grading
+Workaround:
+Instead of using bit shifting (x << n), we strongly recommend using exponentiation of 2 (x * (2 ** n)) to ensure compatibility across different hardware.
 
-The test grader we provide
+Example:
+Instead of:
 
-```bash
-python3 -m grader homework -v
+```python
+index = (binary_code << torch.arange(codebook_bits))
 ```
 
-This will run a subset of test cases we use during the actual testing.
-The point distributions will be the same, but we will use additional test cases.
-The performance of the test grader may vary.
+Use:
 
-## Extra Credit (5 pts)
+```python
+index = (binary_code * (2 ** torch.arange(codebook_bits)))
+```
 
-Can you compress the model below 4 bits per parameters?
-Let's start with `homework/lower_precision.py`. The memory requirements here are very strict (<9MB), with still a decent accuracy.
-This will require implementing your own block quantizer. Only attempt this if you have plenty of free time!
+This will avoid computation errors when running the BSQ model on Apple Silicon (e.g., M1, M2, M3).
 
 ## Submission
 

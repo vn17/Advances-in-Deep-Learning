@@ -1,6 +1,4 @@
-from contextlib import contextmanager
-from copy import deepcopy
-from dataclasses import dataclass
+import math
 from pathlib import Path
 
 import numpy as np
@@ -8,338 +6,307 @@ import torch
 
 from .grader import Case, Grader
 
-BIGNET_PTH = Path(__file__).parent.parent / "bignet.pth"
-BIGNET_DIM = 1024
+CKPT_TEMPLATE = "*_{}.pth"
 
 
-def fit_binary_classifier(model: torch.nn.Module, steps: int = 5000):
+class PatchAutoEncoderGrader(Grader):
+    """Patch AutoEncoder"""
+
     device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-    model = model.to(device)
 
-    # Add binary classifier layer that is not trainable
-    classifier = torch.nn.Linear(BIGNET_DIM, 1, bias=False).to(device)
-    classifier.requires_grad = False
+    VALIDATION_LOSS_BOUND = 0.01, 0.015
+    BOTTLENECK_DIM_BOUND = 256
 
-    # Generate random data
-    x = torch.randn(1000, BIGNET_DIM).to(device)
-    y = torch.cat([torch.zeros(500), torch.ones(500)]).to(device)
+    def load_model(self) -> torch.nn.Module:
+        """
+        Load a model from the checkpoint
+        """
+        model = self.module.ae.load().to(self.device)
+        model.eval()
+        return model
 
-    # Training setup
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-    criterion = torch.nn.BCEWithLogitsLoss()
+    def validation_step(self, model, x):
+        x = x.float() / 255.0 - 0.5
+        with torch.no_grad():
+            z = model.encode(x)
+            assert z.shape[-1] <= self.BOTTLENECK_DIM_BOUND, f"Bottleneck dimension is too large: {z.shape[-1]}"
+            x_hat = model.decode(z)
+            loss = torch.nn.functional.mse_loss(x_hat, x)
+        return loss
 
-    best_accuracy = 0
+    def normalize_score(self, loss, min_loss, max_loss):
+        """
+        Returns a score based on model's loss normalized to [0, 1]
 
-    # Training loop
-    model.eval()
-    for epoch in range(steps):
-        optimizer.zero_grad()
+        If the loss is less than or equal to min_loss, you get 1.0 (full score)
+        If the loss is greater than or equal to max_loss, you get 0.0 (no points)
+        Otherwise, score is linearly interpolated between these extremes
+        """
+        # Normalize so that lower loss gives higher score
+        score_normalized = 1.0 - (loss - min_loss) / (max_loss - min_loss)
+        return np.clip(score_normalized, 0.0, 1.0)
 
-        features = model(x)
-        logits = classifier(features)
+    @Case(score=30, timeout=50000)
+    def test_validation_loss(self):
+        """Image Reconstruction MSE Loss"""
+        # return 1.0
+        dataset = self.module.ImageDataset("valid")
+        dataloader = torch.utils.data.DataLoader(dataset, batch_size=4096, num_workers=4, shuffle=False)
+        model = self.load_model()
+        losses = []
+        for x in dataloader:
+            x = x.to(self.device)
+            loss = self.validation_step(model, x)
+            losses.append(loss.item())
+        mean_loss = sum(losses) / len(losses)
+        print("Validation loss:", mean_loss)
+        return self.normalize_score(mean_loss, *self.VALIDATION_LOSS_BOUND)
 
-        loss = criterion(logits.squeeze(), y)
 
-        loss.backward()
-        optimizer.step()
+class BSQPatchAutoEncoderGrader(PatchAutoEncoderGrader):
+    """BSQ Patch AutoEncoder"""
+
+    VALIDATION_LOSS_BOUND = 0.005, 0.01
+    BOTTLENECK_SIZE_BOUND = 1200
+
+    def load_model(self) -> torch.nn.Module:
+        """
+        Load a model from the checkpoint
+        """
+        model = self.module.bsq.load().to(self.device)
+        model.eval()
+        return model
+
+    def validation_step(self, model, x):
+        x = x.float() / 255.0 - 0.5
+        with torch.no_grad():
+            z = model.encode_index(x)
+            bsq_bottleneck_size = z.shape[1] * z.shape[2]
+            assert (
+                bsq_bottleneck_size <= self.BOTTLENECK_SIZE_BOUND
+            ), f"Bottleneck size is too large: {bsq_bottleneck_size}"
+            x_hat = model.decode_index(z)
+            loss = torch.nn.functional.mse_loss(x_hat, x)
+        return loss
+
+
+class AutoregressiveGrader(PatchAutoEncoderGrader):
+    """Autoregressive Model"""
+
+    KIND = "AutoregressiveModel"
+    TOKENIZER_KIND = "BSQPatchAutoEncoder"
+
+    COMPRESSION_RATE_BOUND = 4500, 4800
+    REGRESSIVENESS_SAMPLES = 100
+    REGRESSIVENESS_CHANGE_RATIO_BOUND = 0.20
+
+    def load_models(self) -> tuple[torch.nn.Module, torch.nn.Module]:
+        """
+        Load a model from the checkpoint
+        """
+        model = self.module.autoregressive.load().to(self.device)
+        model.eval()
+        tokenizer = self.module.bsq.load().to(self.device)
+        tokenizer.eval()
+        return model, tokenizer
+
+    def validation_step(self, model, x):
+        with torch.no_grad():
+            x_hat, _ = model(x)
+            loss = (
+                torch.nn.functional.cross_entropy(x_hat.view(-1, x_hat.shape[-1]), x.view(-1), reduction="sum")
+                / math.log(2)
+                / x.shape[0]
+            )
+        return loss
+
+    @Case(score=15, timeout=50000)
+    def test_validation_loss(self):
+        """Autoregressive prediction loss"""
+        from tqdm import tqdm
+
+        # return 1.0
+        dataset = self.module.ImageDataset("valid")
+        dataloader = torch.utils.data.DataLoader(dataset, batch_size=64, num_workers=4, shuffle=False)
+
+        model, tokenizer = self.load_models()
+
+        total_loss = 0
+        for x in tqdm(dataloader, desc="Compute validation autoregressive loss"):
+            x = x.float().to(self.device) / 255.0 - 0.5
+            tokenized_x = tokenizer.encode_index(x)
+            loss = self.validation_step(model, tokenized_x)
+            total_loss += loss.item()
+            print("loss:", loss.item())
+        mean_loss = total_loss / len(dataloader)
+        print("Validation loss:", mean_loss)
+        return self.normalize_score(mean_loss, *self.COMPRESSION_RATE_BOUND)
+
+    @Case(score=15, timeout=50000)
+    def test_autoregressiveness(self):
+        """Check autoregressiveness of the model"""
+        # return 1.0
+        import random
+
+        model, tokenizer = self.load_models()
+
+        dataset = self.module.ImageDataset("valid")
+        dataloader = torch.utils.data.DataLoader(dataset, batch_size=1, num_workers=1, shuffle=True)
+
+        x = next(iter(dataloader)).to(self.device)
+        x = x.float().to(self.device) / 255.0 - 0.5
+        x = tokenizer.encode_index(x)
 
         with torch.no_grad():
-            accuracy = ((logits.squeeze() > 0) == y).float().mean()
-            print(f"Epoch {epoch + 1}: Loss = {loss:.4f}, Accuracy = {accuracy:.4f}")
+            pred, _ = model(x)
 
-            if accuracy > best_accuracy:
-                best_accuracy = accuracy
+        cls_dim = pred.shape[-1]
+        pred_flat = pred.view(x.shape[0], -1, cls_dim)
 
-    return best_accuracy
+        sample_num = self.REGRESSIVENESS_SAMPLES
+        x_flat = x.view(x.shape[0], -1).clone()
+        x_flat_samples = x_flat.repeat(sample_num, 1)
 
+        for bidx in range(sample_num):
+            tidx = random.randint(1, pred_flat.shape[1] - 2)
+            x_flat_samples[bidx, tidx] = (x_flat_samples[bidx, tidx] + 1) % max(x_flat.max() + 1, 2)
 
-def compare_model_forward(model1: torch.nn.Module, model2: torch.nn.Module, device: str):
-    x = torch.randn(1024, BIGNET_DIM).to(device)
-    with torch.no_grad():
-        max_diff = float(abs(model1(x) - model2(x)).max())
-        mean_diff = float(abs(model1(x) - model2(x)).mean())
+        with torch.no_grad():
+            x_modified = x_flat_samples.view(sample_num, *x.shape[1:])
+            pred_modified, _ = model(x_modified)
+            pred_modified_flat = pred_modified.view(sample_num, -1, cls_dim)
 
-    return max_diff, mean_diff
+        threshold = 1e-5
+        mean_num_tokens_same = ((pred_flat - pred_modified_flat).abs() < threshold).all(-1).sum(1).float().mean()
 
-
-@dataclass
-class MemoryProfile:
-    total: int = 0
-
-    def __int__(self) -> int:
-        return self.total
-
-    def __str__(self) -> str:
-        return f"{self.total / 1024.0 / 1024.0} MB"
-
-
-@contextmanager
-def memory_profile(device):
-    if device == "cuda":
-        mem = MemoryProfile()
-        _mem_init = torch.cuda.memory_allocated()
-        yield mem
-        _mem_end = torch.cuda.memory_allocated()
-        mem.total = _mem_end - _mem_init
-    elif device == "mps":
-        mem = MemoryProfile()
-        _mem_init = torch.mps.current_allocated_memory()
-        yield mem
-        _mem_end = torch.mps.current_allocated_memory()
-        mem.total = _mem_end - _mem_init
-    elif device == "cpu":
-        from torch.profiler import profile
-
-        mem = MemoryProfile()
-        with profile(activities=[torch.profiler.ProfilerActivity.CPU], profile_memory=True) as prof:
-            yield mem
-        mem.total = prof.events().total_average().self_cpu_memory_usage
-    else:
-        raise ValueError(f"Unknown device {device}")
+        token_change_ratio = mean_num_tokens_same / pred_flat.shape[1]
+        print(f"token change ratio: {token_change_ratio:.2f}")
+        assert (
+            abs(token_change_ratio - 0.5) <= self.REGRESSIVENESS_CHANGE_RATIO_BOUND
+        ), f"token change ratio is too large: {token_change_ratio:.2f}"
 
 
-def num_parameters(model: torch.nn.Module) -> int:
-    """
-    Number of parameters and buffers in a model.
-    """
-    from itertools import chain
+class GenerationGrader(AutoregressiveGrader):
+    """Image Generation from Autoregressive Model"""
 
-    return sum(p.numel() for p in chain(model.buffers(), model.parameters()))
+    N_IMAGES = 8
+    NLL_BOUND = 6.50
 
+    def test_validation_loss(self):
+        pass
 
-def mem_parameters(model: torch.nn.Module) -> int:
-    """
-    Memory used for parameters and buffers in a model in bytes.
-    """
-    from itertools import chain
+    def test_autoregressiveness(self):
+        pass
 
-    return sum(p.numel() * p.element_size() for p in chain(model.buffers(), model.parameters()))
+    @Case(score=10, timeout=100000)
+    def test_generation(self):
+        """Check image generation from the model"""
+        # return 1.0
+        ar_model, tk_model = self.load_models()
 
+        dummy_index = tk_model.encode_index(torch.zeros(1, 100, 150, 3, device=self.device))
+        _, h, w = dummy_index.shape
 
-@dataclass
-class ModelStats:
-    num_parameters: int
-    "Number of parameters in the model"
+        print(f"generating {self.N_IMAGES} images from the autoregressive model")
+        generations = ar_model.generate(self.N_IMAGES, h, w, device=self.device)
 
-    trainable_parameters: int
-    "Number of trainable parameters in the model"
+        # run the model on the generations to get the logits
+        logits, _ = ar_model(generations)
 
-    theoretical_memory: float
-    "Memory usage of the model in MB (theoretical)"
-
-    actual_memory: float
-    "Memory usage of the forward pass in MB"
-
-    forward_memory: float
-    "Memory usage of the forward pass in MB"
-
-    backward_memory: float
-    "Memory usage of the backward pass in MB"
-
-    @classmethod
-    def from_model(cls, m: torch.nn.Module, device: str | None = None):
-        """
-        Collect statistics about a model and its memory usage, supporting CPU, CUDA, and MPS.
-        """
-        original_device = next(m.parameters()).device
-
-        if device is None:
-            device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-
-        if device == "mps":
-            torch.mps.empty_cache()
-
-        m.to("cpu")
-        with memory_profile(device) as mem_model:
-            if device == "cpu":
-                m_copy = deepcopy(m)
-            else:
-                m_copy = m.to(device)
-        del m_copy
-
-        x = torch.randn(1024, BIGNET_DIM).to(device)
-
-        with memory_profile(device) as mem_forward:
-            with torch.no_grad():
-                m(x)
-
-        with memory_profile(device) as mem_backward:
-            m(x).mean().backward()
-
-        if device == "mps":
-            torch.mps.empty_cache()
-
-        m.to(original_device)
-        return cls(
-            num_parameters=num_parameters(m),
-            trainable_parameters=sum(p.numel() for p in m.parameters() if p.requires_grad),
-            theoretical_memory=mem_parameters(m) / 2**20,
-            actual_memory=int(mem_model) / 2**20,
-            forward_memory=int(mem_forward) / 2**20,
-            backward_memory=int(mem_backward) / 2**20,
+        # compute the NLL of the generations
+        nll = torch.nn.functional.cross_entropy(
+            logits.view(-1, logits.shape[-1]), generations.view(-1), reduction="mean"
         )
+        print("Generation NLL:", nll.item())
+        assert nll.item() < self.NLL_BOUND, f"Generation NLL is too high: {nll.item():.4f}"
+
+        images = tk_model.decode_index(generations).cpu()
+        # flatten the images and convert to a tensor for efficient comparison
+        flattened_images = images.reshape(images.size(0), -1)
+        _, counts = torch.unique(flattened_images, dim=0, return_counts=True)
+        duplicate_found = (counts > 1).any().item()
+
+        assert not duplicate_found, "Duplicate images found among the generated images."
 
 
-class LoraGrader(Grader):
-    """LoRA"""
+class CompressionGrader(AutoregressiveGrader):
+    """Image Compression"""
 
-    KIND = "lora"
-    TRAIN_STEPS = 20
-    ACC_RANGE = 0.50, 0.8
-    MEAN_DIFF_BOUND = 5e-4
-    MAX_DIFF_BOUND = 5e-3
+    SOURCE_IMG_DIR = "data/valid"
 
-    TRAINABLE_PARAMS_BOUND = 2 * 1000000  # 2M
-    TOTAL_PARAMS_BOUND = 25 * 1000000  # 25M
-    TOTAL_MEMORY_BOUND = 50  # MB
-    BACKWARD_MEMORY_BOUND = 10  # MB
+    COMPRESSION_RATIO_BOUND = 7.5, 14.0
+    MSE_BOUND = 0.1
+    NUM_SAMPLES = 5
 
-    device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-
-    def accuracy(
-        self, model: torch.nn.Module, min_accuracy: float = 0.5, max_accuracy: float = 1.0
-    ) -> tuple[float, str]:
-        """
-        Returns the accuracy of the model normalized to [0, 1]
-
-        If the accuracy is greater than max_accuracy, you get 1.0 (full score)
-        Similarly, if the model's accuracy less than min_accuracy, you get 0.0 (no points)
-        """
-        model.to(self.device)
-        accuracy = fit_binary_classifier(model, self.TRAIN_STEPS)
-        accuracy_normalized = (accuracy - min_accuracy) / (max_accuracy - min_accuracy)
-        accuracy_normalized = accuracy_normalized.item()
-        return np.clip(accuracy_normalized, 0.0, 1.0)
-
-    def load_model(self, model_name: str) -> torch.nn.Module:
-        """
-        Load a model from the checkpoint
-        """
-        all_models = {
-            "bignet": self.module.bignet,
-            "lora": self.module.lora,
-            "low_precision": self.module.low_precision,
-            "half_precision": self.module.half_precision,
-            "qlora": self.module.qlora,
-        }
-        if model_name not in all_models:
-            raise ValueError(f"Unknown model {model_name}")
-        return all_models[model_name].load(BIGNET_PTH)
-
-    @Case(score=10, timeout=5000)
-    def test_forward_diff(self):
-        """Forward accuracy"""
-        bigmodel = self.load_model("bignet").to(self.device)
-        low_res_model = self.load_model(self.KIND).to(self.device)
-        max_diff, mean_diff = compare_model_forward(bigmodel, low_res_model, self.device)
-        assert mean_diff < self.MEAN_DIFF_BOUND, f"Mean difference is too high: {mean_diff:.4f}"
-        assert max_diff < self.MAX_DIFF_BOUND, f"Max difference is too high: {max_diff:.4f}"
-
-    @Case(score=10, timeout=5000)
-    def test_forward_stats(self):
-        """Memory and parameters"""
-        model = self.load_model(self.KIND)
-        stats = ModelStats.from_model(model)
-
-        assert (
-            stats.trainable_parameters < self.TRAINABLE_PARAMS_BOUND
-        ), f"Trainable parameters are too high: {stats.trainable_parameters:.4f}"
-        assert (
-            stats.num_parameters < self.TOTAL_PARAMS_BOUND
-        ), f"Total parameters are too high: {stats.num_parameters:.4f}"
-        assert stats.actual_memory < self.TOTAL_MEMORY_BOUND, f"Actual memory is too high: {stats.actual_memory:.4f}"
-        # assert stats.backward_memory < self.BACKWARD_MEMORY_BOUND, f"Backward memory too high: {stats.backward_memory:.4f}"  # noqa: E501
-
-    @Case(score=10, timeout=50000)
-    def test_accuracy(self):
-        """Backward accuracy"""
-        model = self.load_model(self.KIND)
-        return self.accuracy(model, *self.ACC_RANGE)
-
-
-class QLORAGrader(LoraGrader):
-    """QLORA"""
-
-    KIND = "qlora"
-    MEAN_DIFF_BOUND = 1e-1
-    MAX_DIFF_BOUND = 5e-1
-
-    TRAINABLE_PARAMS_BOUND = 1.5 * 1000000  # 1.5M
-    TOTAL_PARAMS_BOUND = 15 * 1000000  # 15M
-    TOTAL_MEMORY_BOUND = 20  # MB
-    BACKWARD_MEMORY_BOUND = 15  # MB
-
-
-class LowPrecisionGrader(LoraGrader):
-    """Low Precision"""
-
-    KIND = "low_precision"
-
-    MEAN_DIFF_BOUND = 1e-1
-    MAX_DIFF_BOUND = 5e-1
-
-    TRAINABLE_PARAMS_BOUND = 0.1 * 1000000  # 0.1M
-    TOTAL_PARAMS_BOUND = 15 * 1000000  # 15M
-    TOTAL_MEMORY_BOUND = 15  # MB
-    BACKWARD_MEMORY_BOUND = 10  # MB
-
-    def test_accuracy(self):
-        # skip training low-precision model
+    def test_validation_loss(self):
         pass
 
-
-class HalfPrecisionGrader(QLORAGrader):
-    """Half Precision"""
-
-    ACC_RANGE = 0.90, 1.0
-    KIND = "half_precision"
-    MEAN_DIFF_BOUND = 1e-3
-    MAX_DIFF_BOUND = 1e-2
-
-    TRAINABLE_PARAMS_BOUND = 20 * 1000000  # 20M
-    TOTAL_PARAMS_BOUND = 20 * 1000000  # 20M
-    TOTAL_MEMORY_BOUND = 40  # MB
-    BACKWARD_MEMORY_BOUND = 0.1  # MB
-
-    def test_accuracy(self):
-        # skip training half-precision model
+    def test_autoregressiveness(self):
         pass
 
-class ExtraCreditGrader(Grader):
-    """Lower Precision"""
-
-    MEAN_DIFF_BOUND = 1e-1
-    MAX_DIFF_BOUND = 5e-1
-
-    TOTAL_MEMORY_BOUND = 9  # MB
-
-    # mps is not supported for this extra credit
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    def load_model(self, model_name: str) -> torch.nn.Module:
+    def normalize_score(self, ratio, min_ratio, max_ratio):
         """
-        Load a model from the checkpoint
+        Returns a score based on model's compression ratio normalized to [0, 1]
+
+        If the ratio is greater than or equal to max_ratio, you get 1.0 (full score)
+        If the ratio is less than or equal to min_ratio, you get 0.0 (no points)
+        Otherwise, score is linearly interpolated between these extremes
         """
-        all_models = {
-            "bignet": self.module.bignet,
-            "lower_precision": self.module.lower_precision,
-        }
-        if model_name not in all_models:
-            raise ValueError(f"Unknown model {model_name}")
-        return all_models[model_name].load(BIGNET_PTH)
+        # Normalize so that lower loss gives higher score
+        score_normalized = (ratio - min_ratio) / (max_ratio - min_ratio)
+        return np.clip(score_normalized, 0.0, 1.0)
 
-    @Case(score=5, timeout=5000, extra_credit=True)
-    def test_forward_diff(self):
-        """Extra Credit"""
-        lower_model = self.load_model("lower_precision").to(self.device)
-        stats = ModelStats.from_model(lower_model, self.device)
+    @Case(score=5, timeout=100000)
+    def test_compression(self):
+        """Check image compression ratio and reconstruction quality"""
+        # return 1.0
+        import os
+        import random
 
-        bigmodel = self.load_model("bignet").to(self.device)
-        max_diff, mean_diff = compare_model_forward(bigmodel, lower_model, self.device)
-        assert mean_diff < self.MEAN_DIFF_BOUND, f"Mean difference is too high: {mean_diff:.4f}, memory: {stats.actual_memory:.4f}"
-        assert max_diff < self.MAX_DIFF_BOUND, f"Max difference is too high: {max_diff:.4f}"
+        import numpy as np
+        from PIL import Image
+        from tqdm import tqdm
 
-        assert stats.actual_memory < self.TOTAL_MEMORY_BOUND, f"Actual memory is too high: {stats.actual_memory:.4f}, mean_diff: {mean_diff:.4f}"
-        assert (
-            stats.theoretical_memory < self.TOTAL_MEMORY_BOUND
-        ), f"Theoretical memory is too high: {stats.theoretical_memory:.4f}"
+        valid_images = [f for f in os.listdir(self.SOURCE_IMG_DIR) if f.endswith(".jpg")]
+        if not valid_images:
+            raise ValueError(f"No images found in {self.SOURCE_IMG_DIR}")
+
+        compression_ratios = []
+        mses = []
+
+        # Create compressor
+        ar_model, tk_model = self.load_models()
+        cmp = self.module.Compressor(tk_model, ar_model)
+
+        for _ in tqdm(range(self.NUM_SAMPLES), desc="Checking compression"):
+            random_image_file = random.choice(valid_images)
+            image_path = Path(self.SOURCE_IMG_DIR) / random_image_file
+
+            # Load image and convert to tensor
+            original_image = Image.open(image_path)
+            x = torch.tensor(np.array(original_image), dtype=torch.uint8, device=self.device)
+
+            # Calculate original size in KB
+            original_size_kb = os.path.getsize(image_path) / 1024
+
+            # Calculate compressed size
+            compressed_bytes = cmp.compress(x.float() / 255.0 - 0.5)
+            compressed_size_kb = len(compressed_bytes) / 1024
+
+            # Decompress and calculate MSE
+            decompressed_image = cmp.decompress(compressed_bytes)
+            mse = torch.nn.functional.mse_loss(decompressed_image, x.float() / 255.0 - 0.5)
+            compression_ratio = original_size_kb / compressed_size_kb
+
+            compression_ratios.append(compression_ratio)
+            mses.append(mse.item())
+
+        mean_compression_ratio = sum(compression_ratios) / len(compression_ratios)
+        mean_mse = sum(mses) / len(mses)
+
+        print(f"MSE: {mean_mse:.6f}")
+        assert mean_mse <= self.MSE_BOUND, f"MSE is too high: {mean_mse:.6f}"
+
+        # Calculate compression ratio
+        print(f"Compression ratio: {mean_compression_ratio:.2f}x")
+        return self.normalize_score(mean_compression_ratio, *self.COMPRESSION_RATIO_BOUND)

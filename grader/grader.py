@@ -243,6 +243,12 @@ def load_assignment(logger, assignment_path: str, pre_import_fn=None):
 
             module_names = list(module_dir.glob("*/"))
 
+            dataset_path = Path(__file__).parent.parent / "data"
+
+            # set soft link of the data folder to the module_dir/data
+            if dataset_path.exists() and not module_dir.joinpath("data").exists():
+                module_dir.joinpath("data").symlink_to(dataset_path)
+
             if len(module_names) != 1:
                 logger.error(f"Malformed zip file, expected one top-level folder, got {len(module_names)}")
                 return None
