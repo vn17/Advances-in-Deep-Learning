@@ -98,26 +98,31 @@ class PatchAutoEncoder(nn.Module, PatchAutoEncoderBase):
     class PatchEncoder(nn.Module):
         def __init__(self, patch_size: int, latent_dim: int, bottleneck: int):
             super().__init__()
-            self.net = nn.Sequential(
-                PatchifyLinear(patch_size, latent_dim),
-                nn.GELU(),
-                nn.Conv2d(latent_dim, bottleneck, kernel_size=1)
-            )
+            self.patchify = PatchifyLinear(patch_size, latent_dim)
+            self.gelu = nn.GELU()
+            self.conv = nn.Conv2d(latent_dim, bottleneck, kernel_size=1)
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
-            return self.net(x)
+            x = self.patchify(x)      # (B,H//P,W//P,latent_dim)
+            x = hwc_to_chw(x)         # (B,latent_dim,H//P,W//P)
+            x = self.gelu(x)
+            x = self.conv(x)          # (B,bottleneck,H//P,W//P)
+            x = chw_to_hwc(x)         # back to (B,H//P,W//P,bottleneck)
+            return x
 
     class PatchDecoder(nn.Module):
         def __init__(self, patch_size: int, latent_dim: int, bottleneck: int):
             super().__init__()
-            self.net = nn.Sequential(
-                nn.Conv2d(bottleneck, latent_dim, kernel_size=1),
-                nn.GELU(),
-                UnpatchifyLinear(patch_size, latent_dim)
-            )
+            self.conv = nn.Conv2d(bottleneck, latent_dim, kernel_size=1)
+            self.gelu = nn.GELU()
+            self.unpatchify = UnpatchifyLinear(patch_size, latent_dim)
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
-            return self.net(x)
+            x = hwc_to_chw(x)         # (B,bottleneck,H//P,W//P)
+            x = self.gelu(self.conv(x)) 
+            x = chw_to_hwc(x)         # (B,H//P,W//P,latent_dim)
+            x = self.unpatchify(x)    # (B,H,W,3)
+            return x
 
     def __init__(self, patch_size: int = 25, latent_dim: int = 128, bottleneck: int = 128):
         super().__init__()

@@ -2,129 +2,140 @@ import abc
 
 import torch
 
-from .ae import PatchAutoEncoder
-
 
 def load() -> torch.nn.Module:
     from pathlib import Path
 
-    model_name = "BSQPatchAutoEncoder"
+    model_name = "PatchAutoEncoder"
     model_path = Path(__file__).parent / f"{model_name}.pth"
     print(f"Loading {model_name} from {model_path}")
     return torch.load(model_path, weights_only=False)
 
 
-def diff_sign(x: torch.Tensor) -> torch.Tensor:
+def hwc_to_chw(x: torch.Tensor) -> torch.Tensor:
     """
-    A differentiable sign function using the straight-through estimator.
-    Returns -1 for negative values and 1 for non-negative values.
+    Convert an arbitrary tensor from (H, W, C) to (C, H, W) format.
+    This allows us to switch from trnasformer-style channel-last to pytorch-style channel-first
+    images. Works with or without the batch dimension.
     """
-    sign = 2 * (x >= 0).float() - 1
-    return x + (sign - x).detach()
+    dims = list(range(x.dim()))
+    dims = dims[:-3] + [dims[-1]] + [dims[-3]] + [dims[-2]]
+    return x.permute(*dims)
 
 
-class Tokenizer(abc.ABC):
+def chw_to_hwc(x: torch.Tensor) -> torch.Tensor:
     """
-    Base class for all tokenizers.
-    Implement a specific tokenizer below.
+    The opposite of hwc_to_chw. Works with or without the batch dimension.
+    """
+    dims = list(range(x.dim()))
+    dims = dims[:-3] + [dims[-2]] + [dims[-1]] + [dims[-3]]
+    return x.permute(*dims)
+
+
+class PatchifyLinear(torch.nn.Module):
+    """
+    Takes an image tensor of the shape (B, H, W, 3) and patchifies it into
+    an embedding tensor of the shape (B, H//patch_size, W//patch_size, latent_dim).
+    It applies a linear transformation to each input patch
+
+    Feel free to use this directly, or as an inspiration for how to use conv the the inputs given.
     """
 
-    @abc.abstractmethod
-    def encode_index(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Tokenize an image tensor of shape (B, H, W, C) into
-        an integer tensor of shape (B, h, w) where h * patch_size = H and w * patch_size = W
-        """
-
-    @abc.abstractmethod
-    def decode_index(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Decode a tokenized image into an image tensor.
-        """
-
-
-class BSQ(torch.nn.Module):
-    def __init__(self, codebook_bits: int, embedding_dim: int):
+    def __init__(self, patch_size: int = 25, latent_dim: int = 128):
         super().__init__()
-        raise NotImplementedError()
-
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Implement the BSQ encoder:
-        - A linear down-projection into codebook_bits dimensions
-        - L2 normalization
-        - differentiable sign
-        """
-        raise NotImplementedError()
-
-    def decode(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Implement the BSQ decoder:
-        - A linear up-projection into embedding_dim should suffice
-        """
-        raise NotImplementedError()
+        self.patch_conv = torch.nn.Conv2d(3, latent_dim, patch_size, patch_size, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.decode(self.encode(x))
-
-    def encode_index(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Run BQS and encode the input tensor x into a set of integer tokens
+        x: (B, H, W, 3) an image tensor dtype=float normalized to -1 ... 1
+
+        return: (B, H//patch_size, W//patch_size, latent_dim) a patchified embedding tensor
         """
-        return self._code_to_index(self.encode(x))
-
-    def decode_index(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Decode a set of integer tokens into an image.
-        """
-        return self.decode(self._index_to_code(x))
-
-    def _code_to_index(self, x: torch.Tensor) -> torch.Tensor:
-        x = (x >= 0).int()
-        return (x * 2 ** torch.arange(x.size(-1)).to(x.device)).sum(dim=-1)
-
-    def _index_to_code(self, x: torch.Tensor) -> torch.Tensor:
-        return 2 * ((x[..., None] & (2 ** torch.arange(self._codebook_bits).to(x.device))) > 0).float() - 1
+        return chw_to_hwc(self.patch_conv(hwc_to_chw(x)))
 
 
-class BSQPatchAutoEncoder(PatchAutoEncoder, Tokenizer):
+class UnpatchifyLinear(torch.nn.Module):
     """
-    Combine your PatchAutoEncoder with BSQ to form a Tokenizer.
+    Takes an embedding tensor of the shape (B, w, h, latent_dim) and reconstructs
+    an image tensor of the shape (B, w * patch_size, h * patch_size, 3).
+    It applies a linear transformation to each input patch
 
-    Hint: The hyper-parameters below should work fine, no need to change them
-          Changing the patch-size of codebook-size will complicate later parts of the assignment.
+    Feel free to use this directly, or as an inspiration for how to use conv the the inputs given.
     """
 
-    def __init__(self, patch_size: int = 5, latent_dim: int = 128, codebook_bits: int = 10):
-        super().__init__(patch_size=patch_size, latent_dim=latent_dim)
-        raise NotImplementedError()
+    def __init__(self, patch_size: int = 25, latent_dim: int = 128):
+        super().__init__()
+        self.unpatch_conv = torch.nn.ConvTranspose2d(latent_dim, 3, patch_size, patch_size, bias=False)
 
-    def encode_index(self, x: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (B, w, h, latent_dim) an embedding tensor
 
-    def decode_index(self, x: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError()
+        return: (B, H * patch_size, W * patch_size, 3) a image tensor
+        """
+        return chw_to_hwc(self.unpatch_conv(hwc_to_chw(x)))
 
+
+class PatchAutoEncoderBase(abc.ABC):
+    @abc.abstractmethod
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError()
+        """
+        Encode an input image x (B, H, W, 3) into a tensor (B, h, w, bottleneck),
+        where h = H // patch_size, w = W // patch_size and bottleneck is the size of the
+        AutoEncoders bottleneck.
+        """
 
+    @abc.abstractmethod
     def decode(self, x: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError()
+        """
+        Decode a tensor x (B, h, w, bottleneck) into an image (B, H, W, 3),
+        We will train the auto-encoder such that decode(encode(x)) ~= x.
+        """
+
+import torch
+import torch.nn as nn
+class PatchAutoEncoder(nn.Module, PatchAutoEncoderBase):
+    class PatchEncoder(nn.Module):
+        def __init__(self, patch_size: int, latent_dim: int, bottleneck: int):
+            super().__init__()
+            self.patchify = PatchifyLinear(patch_size, latent_dim)
+            self.gelu = nn.GELU()
+            self.conv = nn.Conv2d(latent_dim, bottleneck, kernel_size=1)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            x = self.patchify(x)      # (B,H//P,W//P,latent_dim)
+            x = hwc_to_chw(x)         # (B,latent_dim,H//P,W//P)
+            x = self.gelu(x)
+            x = self.conv(x)          # (B,bottleneck,H//P,W//P)
+            x = chw_to_hwc(x)         # back to (B,H//P,W//P,bottleneck)
+            return x
+
+    class PatchDecoder(nn.Module):
+        def __init__(self, patch_size: int, latent_dim: int, bottleneck: int):
+            super().__init__()
+            self.conv = nn.Conv2d(bottleneck, latent_dim, kernel_size=1)
+            self.gelu = nn.GELU()
+            self.unpatchify = UnpatchifyLinear(patch_size, latent_dim)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            x = hwc_to_chw(x)         # (B,bottleneck,H//P,W//P)
+            x = self.gelu(self.conv(x)) 
+            x = chw_to_hwc(x)         # (B,H//P,W//P,latent_dim)
+            x = self.unpatchify(x)    # (B,H,W,3)
+            return x
+
+    def __init__(self, patch_size: int = 25, latent_dim: int = 128, bottleneck: int = 128):
+        super().__init__()
+        self.encoder = self.PatchEncoder(patch_size, latent_dim, bottleneck)
+        self.decoder = self.PatchDecoder(patch_size, latent_dim, bottleneck)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """
-        Return the reconstructed image and a dictionary of additional loss terms you would like to
-        minimize (or even just visualize).
-        Hint: It can be helpful to monitor the codebook usage with
+        z = self.encode(x)
+        x_rec = self.decode(z)
+        return x_rec, {}
 
-              cnt = torch.bincount(self.encode_index(x).flatten(), minlength=2**self.codebook_bits)
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        return self.encoder(x)
 
-              and returning
-
-              {
-                "cb0": (cnt == 0).float().mean().detach(),
-                "cb2": (cnt <= 2).float().mean().detach(),
-                ...
-              }
-        """
-        raise NotImplementedError()
+    def decode(self, x: torch.Tensor) -> torch.Tensor:
+        return self.decoder(x)
