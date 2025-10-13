@@ -59,7 +59,23 @@ def train(model_name_or_path: str, epochs: int = 5, batch_size: int = 64):
             return loss
 
         def configure_optimizers(self):
-            return torch.optim.AdamW(self.parameters(), lr=1e-3)
+          optimizer = torch.optim.AdamW(self.parameters(), lr=5e-3)
+          scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+              optimizer,
+              mode="min",        # reduce when validation loss stops decreasing
+              factor=0.5,        # multiply LR by 0.5
+              patience=3,        # wait 3 epochs before reducing
+              min_lr=5e-6,       # never go below this
+          )
+          return {
+              "optimizer": optimizer,
+              "lr_scheduler": {
+                  "scheduler": scheduler,
+                  "monitor": "validation/loss",  # metric to watch
+                  "interval": "epoch",
+                  "frequency": 1,
+              },
+          }
 
         def train_dataloader(self):
             dataset = ImageDataset("train")
@@ -67,7 +83,7 @@ def train(model_name_or_path: str, epochs: int = 5, batch_size: int = 64):
 
         def val_dataloader(self):
             dataset = ImageDataset("valid")
-            return torch.utils.data.DataLoader(dataset, batch_size=4096, num_workers=4, shuffle=True)
+            return torch.utils.data.DataLoader(dataset, batch_size=4096, num_workers=4, shuffle=False)
 
     class AutoregressiveTrainer(L.LightningModule):
         def __init__(self, model):
@@ -108,7 +124,7 @@ def train(model_name_or_path: str, epochs: int = 5, batch_size: int = 64):
 
         def val_dataloader(self):
             dataset = TokenDataset("valid")
-            return torch.utils.data.DataLoader(dataset, batch_size=batch_size, num_workers=4, shuffle=True)
+            return torch.utils.data.DataLoader(dataset, batch_size=batch_size, num_workers=4, shuffle=False)
 
     class CheckPointer(L.Callback):
         def on_train_epoch_end(self, trainer, pl_module):
