@@ -67,6 +67,7 @@ class BSQ(nn.Module):
 class BSQPatchAutoEncoder(PatchAutoEncoder, Tokenizer):
     def __init__(self, patch_size: int = 5, latent_dim: int = 128, codebook_bits: int = 10):
         super().__init__(patch_size=patch_size, latent_dim=latent_dim, bottleneck=latent_dim)
+        self.patch_size = patch_size  # Store patch_size explicitly
         self.codebook_bits = codebook_bits
         self.bsq = BSQ(codebook_bits, latent_dim)
 
@@ -83,13 +84,19 @@ class BSQPatchAutoEncoder(PatchAutoEncoder, Tokenizer):
 
     # ---------------- Tokenizer API -------------------
     def encode_index(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, H, W, 3) or (H, W, 3)
+        if x.ndim == 3:
+            x = x.unsqueeze(0)  # Add batch dimension
         z = super().encode(x)          # (B, h, w, latent_dim)
         z = self.bsq.encode(z)         # (B, h, w, codebook_bits)
-        return self.bsq._code_to_index(z)
+        return self.bsq._code_to_index(z)  # (B, h, w)
 
     def decode_index(self, x: torch.Tensor) -> torch.Tensor:
-        z_bin = self.bsq._index_to_code(x)
-        return self.decode(z_bin)
+        # x: (B, h, w) or (h, w)
+        if x.ndim == 2:
+            x = x.unsqueeze(0)  # Add batch dimension
+        z_bin = self.bsq._index_to_code(x)  # (B, h, w, codebook_bits)
+        return self.decode(z_bin)  # (B, H, W, 3)
 
     # ---------------- Forward -------------------
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
