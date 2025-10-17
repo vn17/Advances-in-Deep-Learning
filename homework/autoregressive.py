@@ -33,8 +33,8 @@ class Autoregressive(abc.ABC):
 class AutoregressiveModel(nn.Module, Autoregressive):
     """
     Auto-regressive model using TransformerEncoderLayer (causal transformer).
-    Input:  (B, h, w) integer tokens
-    Output: (B, h, w, n_tokens) probability logits over next tokens.
+    Accepts inputs shaped (B, h, w), (B, seq_len), or (B, C, H, W).
+    Outputs logits shaped (B, h, w, n_tokens).
     """
 
     def __init__(self, d_latent: int = 128, n_tokens: int = 2**10, n_heads: int = 8, n_layers: int = 6):
@@ -45,86 +45,80 @@ class AutoregressiveModel(nn.Module, Autoregressive):
         # Token embedding
         self.token_emb = nn.Embedding(n_tokens, d_latent)
 
-        # Optional positional embedding (learned)
-        self.pos_emb = nn.Embedding(1024, d_latent)  # supports sequences up to 1024
+        # Positional embedding
+        self.pos_emb = nn.Embedding(2048, d_latent)
 
-        # Transformer stack (encoder used as causal decoder)
+        # Transformer
         layer = nn.TransformerEncoderLayer(
             d_model=d_latent,
             nhead=n_heads,
             dim_feedforward=d_latent * 4,
             dropout=0.1,
             activation="gelu",
-            batch_first=True,  # easier to reason about (B, seq, d)
+            batch_first=True,
         )
         self.transformer = nn.TransformerEncoder(layer, num_layers=n_layers)
 
-        # Output projection back to token logits
+        # Output projection
         self.output = nn.Linear(d_latent, n_tokens)
 
     # -----------------------------------------------------------------
-    # Forward pass
-    # -----------------------------------------------------------------
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-      """
-      x: LongTensor (B, h, w) or (B, seq)
-      Returns:
-          logits: (B, h, w, n_tokens)
-          metrics: (empty for now)
-      """
-      if x.dim() == 3:
-          B, h, w = x.shape
-          seq_len = h * w
-          x = x.view(B, seq_len)
-      else:
-          B, seq_len = x.shape
-          # try to infer h, w from sequence length (square or rectangular guess)
-          h = int(math.sqrt(seq_len))
-          w = seq_len // h
+        """
+        Handles (B, h, w), (B, seq), or (B, C, H, W) gracefully.
+        Returns logits: (B, h, w, n_tokens)
+        """
+        # 🔹 Step 1: Normalize input shape
+        if x.dim() == 4:
+            # If input is (B, C, H, W) → reduce to (B, H, W)
+            if x.size(1) == 1:  # single channel tokens
+                x = x.squeeze(1)
+            else:
+                raise ValueError(f"Unexpected 4D input with C={x.size(1)}")
+        if x.dim() == 3:
+            B, h, w = x.shape
+            seq_len = h * w
+            x = x.view(B, seq_len)
+        elif x.dim() == 2:
+            B, seq_len = x.shape
+            h = int(math.sqrt(seq_len))
+            w = seq_len // h
+        else:
+            raise ValueError(f"Unsupported input shape {x.shape}")
 
-      device = x.device
+        device = x.device
 
-      # Shifted input: prepend a BOS (all zeros) token, remove last element
-      bos = torch.zeros((B, 1), device=device, dtype=x.dtype)
-      x_shifted = torch.cat([bos, x[:, :-1]], dim=1)
+        # 🔹 Step 2: Shift sequence for causal prediction
+        bos = torch.zeros((B, 1), device=device, dtype=x.dtype)
+        x_shifted = torch.cat([bos, x[:, :-1]], dim=1)
 
-      # Token + positional embedding
-      token_emb = self.token_emb(x_shifted)  # (B, seq, d)
-      pos_ids = torch.arange(seq_len, device=device).unsqueeze(0)
-      pos_emb = self.pos_emb(pos_ids)
-      emb = token_emb + pos_emb  # (B, seq, d)
+        # 🔹 Step 3: Embeddings
+        token_emb = self.token_emb(x_shifted)
+        pos_ids = torch.arange(seq_len, device=device).unsqueeze(0)
+        pos_emb = self.pos_emb(pos_ids)
+        emb = token_emb + pos_emb
 
-      # Create causal mask (True = mask)
-      mask = torch.triu(torch.ones(seq_len, seq_len, device=device), diagonal=1).bool()
+        # 🔹 Step 4: Causal mask
+        mask = torch.triu(torch.ones(seq_len, seq_len, device=device), diagonal=1).bool()
 
-      # Forward through transformer
-      out = self.transformer(emb, mask=mask)  # (B, seq, d)
+        # 🔹 Step 5: Transformer forward
+        out = self.transformer(emb, mask=mask)
 
-      # Project to vocab logits
-      logits = self.output(out)  # (B, seq, n_tokens)
+        # 🔹 Step 6: Project to logits
+        logits = self.output(out)  # (B, seq, n_tokens)
+        logits = logits.view(B, h, w, self.n_tokens)
 
-      # Reshape back into image grid
-      logits = logits.view(B, h, w, self.n_tokens)
+        return logits, {}
 
-      metrics = {}
-      return logits, metrics
-
-    # -----------------------------------------------------------------
-    # Generation
     # -----------------------------------------------------------------
     @torch.no_grad()
     def generate(self, B: int = 1, h: int = 20, w: int = 30, device=None) -> torch.Tensor:
-        """
-        Generate autoregressively one token at a time.
-        """
         device = device or next(self.parameters()).device
         seq_len = h * w
-
         x = torch.zeros((B, seq_len), dtype=torch.long, device=device)
 
         for i in range(seq_len):
             logits, _ = self.forward(x)
-            # logits: (B, h, w, n_tokens) -> flatten sequence
             logits_seq = logits.view(B, seq_len, self.n_tokens)
             probs = F.softmax(logits_seq[:, i, :], dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)

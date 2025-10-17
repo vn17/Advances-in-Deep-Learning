@@ -86,45 +86,65 @@ def train(model_name_or_path: str, epochs: int = 5, batch_size: int = 64):
             return torch.utils.data.DataLoader(dataset, batch_size=4096, num_workers=4, shuffle=False)
 
     class AutoregressiveTrainer(L.LightningModule):
-        def __init__(self, model):
-            super().__init__()
-            self.model = model
+      def __init__(self, model):
+          super().__init__()
+          self.model = model
 
-        def training_step(self, x, batch_idx):
-            x_hat, additional_losses = self.model(x)
-            loss = (
-                torch.nn.functional.cross_entropy(x_hat.view(-1, x_hat.shape[-1]), x.view(-1), reduction="sum")
-                / math.log(2)
-                / x.shape[0]
-            )
-            self.log("train/loss", loss, prog_bar=True)
-            for k, v in additional_losses.items():
-                self.log(f"train/{k}", v)
-            return loss + sum(additional_losses.values())
+      def training_step(self, batch, batch_idx):
+          # 🔹 Unpack if dataset returns a tuple (e.g. (tokens, _))
+          x = batch[0] if isinstance(batch, (tuple, list)) else batch
+          x_hat, additional_losses = self.model(x)
 
-        def validation_step(self, x, batch_idx):
-            with torch.no_grad():
-                x_hat, additional_losses = self.model(x)
-                loss = (
-                    torch.nn.functional.cross_entropy(x_hat.view(-1, x_hat.shape[-1]), x.view(-1), reduction="sum")
-                    / math.log(2)
-                    / x.shape[0]
-                )
-            self.log("validation/loss", loss, prog_bar=True)
-            for k, v in additional_losses.items():
-                self.log(f"validation/{k}", v)
-            return loss
+          # Cross-entropy loss in bits per token
+          loss = (
+              torch.nn.functional.cross_entropy(
+                  x_hat.view(-1, x_hat.shape[-1]),
+                  x.view(-1),
+                  reduction="sum"
+              )
+              / math.log(2)
+              / x.shape[0]
+          )
 
-        def configure_optimizers(self):
-            return torch.optim.AdamW(self.parameters(), lr=1e-3)
+          # Log metrics
+          self.log("train/loss", loss, prog_bar=True)
+          for k, v in additional_losses.items():
+              self.log(f"train/{k}", v)
 
-        def train_dataloader(self):
-            dataset = TokenDataset("train")
-            return torch.utils.data.DataLoader(dataset, batch_size=batch_size, num_workers=4, shuffle=True)
+          return loss + sum(additional_losses.values())
 
-        def val_dataloader(self):
-            dataset = TokenDataset("valid")
-            return torch.utils.data.DataLoader(dataset, batch_size=batch_size, num_workers=4, shuffle=False)
+      def validation_step(self, batch, batch_idx):
+          # 🔹 Unpack if dataset returns a tuple
+          x = batch[0] if isinstance(batch, (tuple, list)) else batch
+
+          with torch.no_grad():
+              x_hat, additional_losses = self.model(x)
+              loss = (
+                  torch.nn.functional.cross_entropy(
+                      x_hat.view(-1, x_hat.shape[-1]),
+                      x.view(-1),
+                      reduction="sum"
+                  )
+                  / math.log(2)
+                  / x.shape[0]
+              )
+
+          self.log("validation/loss", loss, prog_bar=True)
+          for k, v in additional_losses.items():
+              self.log(f"validation/{k}", v)
+
+          return loss
+
+      def configure_optimizers(self):
+          return torch.optim.AdamW(self.parameters(), lr=1e-3)
+
+      def train_dataloader(self):
+          dataset = TokenDataset("train")
+          return torch.utils.data.DataLoader(dataset, batch_size=batch_size, num_workers=4, shuffle=True)
+
+      def val_dataloader(self):
+          dataset = TokenDataset("valid")
+          return torch.utils.data.DataLoader(dataset, batch_size=batch_size, num_workers=4, shuffle=False)
 
     class CheckPointer(L.Callback):
         def on_train_epoch_end(self, trainer, pl_module):
