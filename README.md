@@ -1,207 +1,157 @@
-# Homework 2 - Auto-regressive image generation
+# Homework 3 - Well reasoned unit conversion
 
-In this homework, we will train an auto-regressive image generation model from scratch on a dataset up supertuxkart images [here](https://utexas.box.com/shared/static/qubjm5isldqvyimfj9rsmbnvnbezwcv4.zip).
-The final model is both a generative model, and an image compressor.
+In this homework, we will train language models to perform unit conversions (meters to yard to feet etc).
+We will use SmolLM2 and the huggingface library (with some more dependencies than usual).
 
-The homework consists of five parts (one optional):
+The homework consists of four parts:
 
-1. Train a patch-level auto-encoder `ae.py`
-2. Convert your auto-encoder into a quantizer `bsq.py` using Binary Spherical Quantization
-3. Convert the training and validation sets into their tokenized form and train an auto-regressive model
-4. Generate samples from the auto-regressive model
-5. (Optional) Use the auto-regressive model to compress your images.
+1. Implement generation and batched generation in `base_llm.py`
+2. Using in-context learning and chain of thought to perform basic unit conversions in `cot.py`
+3. Fine-tune SmolLM2 (using LoRA) to learn to convert units better in `sft.py`
+4. Implement a very basic RL algorithm RFT (Yuan etal. 2023, https://arxiv.org/abs/2308.01825) to fine-tune the model in `rft.py` and `dataset.py`
 
-Familiarize yourself with the starter code, download and unzip the data.
+Familiarize yourself with the starter code. All data ships with the starter code.
 
-```bash
-wget https://utexas.box.com/shared/static/qubjm5isldqvyimfj9rsmbnvnbezwcv4.zip -O supertux_data.zip
-unzip supertux_data.zip
-```
-
-We provide dataloaders for the image dataset, and tokenized versions of the dataset in `data.py`.
-We also provide a full training script including logging in `train.py`.
-To train any model you define in `ae.py`, `autoregressive.py`, or `bsq.py` simply call:
-
-```bash
-python -m homework.train NameOfTheModel
-```
-
-Feel free to optionally provide `--epochs ..` (to train for longer) or `--batch_size` (to manage memory).
-The trainer will produce two files/directories:
-
-- `logs/{date}_{NameOfTheModel}` a tensorboard log (call `tensorboard --logdir logs` to see all logs)
-- `checkpoints/{date}_{NameOfTheModel}.pth` the actual model trained
-
-Finally, we provide the tokenization script (`tokenize.py`) that converts a set of images into a torch tensor of tokens.
+We provide dataloaders for the text data in `data.py`.
 
 ## Grading Criteria
 
-The grading criteria are part-specific and explained below.
-There are 5 pts extra credit to implement compression using the auto-regressive model and entropy coding.
+Each part is worth 25 pts with 5 pts of extra credit for an especially performant RFT model.
 
-## Patch-level auto-encoder (30 pts)
+## Generation with SmolLM2 (25 pts)
 
-We start by implementing the patch-level auto-encoder.
-The goal here is to take an image of size W=150 x H=100 pixels and split it into equal-sized patches of size PxP (anything from P=5 to P=25 will work here).
-For each patch, we compute a d-dimensional embedding using a non-linear function.
-The result is an image of size w x h x d image of features.
-A decoder then maps these features back into the original image space.
+We start by implementing the generation function of SmolLM2.
+We will generate from scratch rather than using huggingface pipelines.
 
-Architecturally almost anything will work here. Use this part of the assignment to get used to the training code, and get warmed up.
-Even a linear encoder and decoder work here.
+To warm up, implement a sequential version of `generate` in `base_llm.py`.
+If you feel confident, skip this and move straight to `batched_generate`.
+We already took care of loading the model and tokenizer.
+You can find some simple examples on how to use SmolLM2 here: <https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B>
 
-Train your network by calling:
+Test your code with
 
 ```bash
-python -m homework.train PatchAutoEncoder
+python -m homework.base_llm test
 ```
 
-## Patch-level Quantizer (30 pts)
+Next, we implement a batched version `batched_generate`.
+Batching will make much better use of your GPU and likely work 10-20x faster than an unbatched version.
+The core structure of batched generation is very similar to regular generation, with one exception: All sequences that go into the transformer need to be of the same length.
+This is achieved through padding the shorter sequences in the left (aligning all sequences on the right, where generation starts).
+The transformers library will take care of padding in the `self.tokenizer` call, simply pass in a `list[str]` of prompts and use `padding=True` and return a PyTorch tensor `return_tensors="pt"`.
+Generation if almost the same between unbatched and batched versions with the only difference being that `self.model.generate` take both `input_ids` (the tokenized input) and `attention_mask` as input.
+`attention_mask` is produced by the tokenizer indicating which inputs have been padded.
+Finally, the `self.tokenizer` should decode the generated output using `batch_decode`.
+This will produce a flat `list[str]` of generations of length `num_return_sequences * len(prompts)`.
+Reshape this list if required (`num_return_sequences is not None`).
 
-In this part, we implement a simplified version of [Binary Spherical Quantization (BSQ)](https://arxiv.org/abs/2406.07548).
-BSQ uses a binary bottleneck of size C where each feature is either -1 or 1. This binary code directly corresponds to an integer token. See `BSQ._code_to_index` and `BSQ._index_to_code` for functions that map a binary vector to an integer feature.
-We provide a differentiable binarization function `diff_sign` in `bsq.py`. It allows for a -1 / 1 quantization and uses a straight-through gradient estimator.
-Using this function directly in a binary bottleneck likely will not work (see BSQ paper for baselines, or feel free to train it yourself).
-However, simply normalizing the inputs to the binarization using an L2-norm will lead to a fairly easy-to-train and efficient quantizer.
-Finally, BSQ projects auto-encoder features down to a lower-dimensional bottleneck (also called codebook dimension), then normalizes, quantizes, and projects everything back into the original space.
+## In context learning (25 pts)
 
-BSQ optimizes several losses in addition to reconstruction (entropy, commitment, GAN, etc).
-For this assignment, you can safely ignore all other losses, a simple differentiable sign and normalization should suffice.
-
-In this part, you should combine your auto-encoder from part 1 with the BSQ quantizer.
-It is highly recommended to follow the hyper-parameters set out in the starter code `patch_size=5` and `codebook_bits = 10`, this will make later parts easier.
-
-Train your network by calling:
-
-```bash
-python -m homework.train BSQPatchAutoEncoder
-```
-
-Make sure to fire up tensorboard `tensorboard --logdir logs` to monitor your training.
-
-A well-trained quantizer will look like this:
-
-![](tensorboard.png)
-
-The above quantizer was trained for an hour in a single GPU.
-It introduces some artifacts, due to limited training, and using just an L2 loss, but anything close to this will suffice for the homework.
-If your quantizer is blocky, or blurry don't worry, you will still be able to complete the assignment. Training a successful quantizer can take as little as 5min on an entry-level GPU.
-
-With the `BSQPatchAutoEncoder` trained, let's create a token-level dataset for the next part.
-
-```bash
-python -m homework.tokenize checkpoints/YOUR_BSQPatchAutoEncoder.pth data/tokenized_train.pth data/train/*.jpg
-
-python -m homework.tokenize checkpoints/YOUR_BSQPatchAutoEncoder.pth data/tokenized_valid.pth data/valid/*.jpg
-```
-
-This will create two files `data/tokenized_train.pth` and `data/tokenized_valid.pth` containing the entire training and validation datasets.
-
-If you're curious, check the tokenized checkpoint size:
-
-```
-du -hs data/tokenized_train.pth
-```
-
-If you follow the hyper-parameters above, it should be around 76Mb (compared to 500Mb for the original JPG dataset).
-This is already a great compression result, but we will be able to get it down further.
-
-## Auto-regressive model (30 pts)
-
-Finally, we will train an auto-regressive model.
-It takes a batch of the tokenized image as input and produces a distribution over next tokens as output.
-
-Design your `AutoregressiveModel` in `autoregressive.py`.
-Many models work here, but a decoder-only transformer might be the easiest.
-As with the quantizer above, you will not require a large network to pass this assignment.
-We recommend using `torch.nn.TransformerEncoderLayer` (not a typo) with a causal mask `torch.nn.Transformer.generate_square_subsequent_mask`.
-For this to work, you should flatten your input image into a sequence first.
-You'll need to take care handling the auto-regressive prediction: The output at location (i, j) should not see the input token at location(i, j) which should predict and only see tokens preceding it.
-You may use a positional embedding, but this is optional.
-
-Once your network is ready, train it using the next-token cross-entropy loss.
-
-```bash
-python -m homework.train AutoregressiveModel
-```
-
-Fun fact: The cross-entropy corresponds to the compression rate an arithmetic coding algorithm can obtain using your model.
-
-Your model should be able to reach an average of 4500 bits per image quite easily.
-A well-trained model can go as low as 4000 bits per image (500 bytes, an order of magnitude smaller than JPG, although not at the same quality).
-
-## Generation (10 pts)
-
-Finally, produce samples from your generative model by implementing `AutoregressiveModel.generate`.
-Since our model is quite small, and the tokenizer is lossy, don't expect great generation results.
-
-Here are samples from a model without positional embedding
-
-![](gen_nopos_1.png) ![](gen_nopos_2.png) ![](gen_nopos_3.png)
-
-As you can see, they mostly capture co-occurrence statistics of patches (within a level).
-
-With a positional embedding, the results look slightly better, but still far from great:
-
-![](gen_pos_1.png) ![](gen_pos_2.png) ![](gen_pos_3.png)
-
-To generate your own samples use
-
-```
-python3 -m homework.generation checkpoints/YOUR_TOKENIZER checkpoints/YOUR_AUTOREGRESSIVE_MODEL N_IMAGES OUTPUT_PATH
-```
-
-If you trained your model for only a few (even one works) epochs, the generations may look like this:
-
-![](gen_one_1.png) ![](gen_one_2.png) ![](gen_one_3.png)
-
-Getting better generations will require:
-
-1. A better Quantizer (smaller patches or higher bitrates)
-2. A much larger transformer
-3. Longer training
-
-## Extra credit: Compression (5 pts)
-
-If you want to challenge yourself, try implementing the `Compressor.compress` and `Compressor.decompress` functions in `compress.py`.
-
-## Checkpoints
-During training, model checkpoints will be automatically saved in the checkpoints/ directory. The latest trained model will also be saved in the homework/ directory and will be used for grading.
-
-If you wish to submit a specific checkpoint instead of the most recent one, you can manually copy the desired checkpoint from checkpoints/ into homework/, overwriting the existing model file. This ensures that the grader evaluates your preferred checkpoint.
-
-For example, if you trained an AutoregressiveModel on 2025-02-27 and want this checkpoint to be graded, run:
-
-```bash
-cp checkpoints/2025-02-27_AutoregressiveModel.pth homework/AutoregressiveModel.pth
-```
-
-## Apple Silicon (MPS) and Bitwise Operations Bug
-
-During the implementation of Binary Spherical Quantization (BSQ), we encountered a bug related to bitwise operations on Apple Silicon (MPS) in PyTorch. Specifically, bit shifting operations (<< and >>) do not work correctly when executed on an MPS-enabled device.
-
-This issue is tracked in the PyTorch repository:
-[PyTorch Issue #147889](https://github.com/pytorch/pytorch/issues/147889)
-
-To work around this issue, we have implemented a custom bitwise operation using the `diff_sign` function. This function provides a differentiable approximation of the sign function, which is equivalent to the bitwise operation in the reference implementation.
-
-Workaround:
-Instead of using bit shifting (x << n), we strongly recommend using exponentiation of 2 (x * (2 ** n)) to ensure compatibility across different hardware.
-
-Example:
-Instead of:
+Implement the `format_prompt` function in `cot.py`.
+Given a `question: str` you should create a chat dialogue that prompts the LLM to produce the correct answer.
+A chat dialogue has the following structure
 
 ```python
-index = (binary_code << torch.arange(codebook_bits))
+messages: list[dict[str, str]] = [
+    {"role": role, "content": content},
+    ...
+]
 ```
 
-Use:
+where `role` is a string literal (`"system"`, `"user"`, or `"assistant"`), and `content` is a free-form string.
+You can use the chat dialogue to both instruct the model to perform a task in the system or user message, and provide in-context examples in a prior assistant message.
+The LLM will do best if you give it:
 
-```python
-index = (binary_code * (2 ** torch.arange(codebook_bits)))
+- brief instructions
+- tell it to `be concise`
+- Give one good example how to solve the task
+
+Use the `self.tokenizer.apply_chat_template` with `add_generation_prompt=True` and `tokenize=False` to convert the chat messages into a single string following the chat-template SmolLM2 expects (including all special tokens, and the beginning of the assistant output).
+Feel free to print this output to familiarize yourself with how this works.
+
+Test your model with
+
+```bash
+python -m homework.cot test
 ```
 
-This will avoid computation errors when running the BSQ model on Apple Silicon (e.g., M1, M2, M3).
+You should be able to reach 0.5 accuracy and 0.85 answer_rate without too much tuning, and a good in-context example.
+
+## Supervised fine-tuning (25 pts)
+
+We will now go and fine-tune SmolLM2 to answer questions directly.
+You should NOT use the chat template here, instead simply ask the model to complete a question with `<answer>{answer}</answer>`, where answer is the ground truth `float` answer.
+
+Due to file-size limitations you will not be able to submit a fully fine-tuned model, but will need to submit a LoRA adapter.
+Use the `get_peft_model` function to convert the `BaseLLM.model` into a LoRA adapted version.
+The function above takes a `LoraConfig` argument, most parameters are quite flexible.
+Our recommendation is to use:
+
+- `target_modules="all-linear"` this will add an adapter to all layers
+- `bias="none"` and `task_type="CAUSAL_LM"`
+- `r` rank such that the overall model size stays below 20MB
+- `lora_alpha` about 4-5 times the rank
+
+If you're using a GPU call `model.enable_input_require_grads()` after adding the LoRA adapter to avoid a bug with `gradient_checkpointing=True,` in the `TrainingArguments` below.
+
+We will use the higgingface `Trainer` to fine-tune the model.
+The trainer takes 3 arguments:
+
+- Our LoRA model
+- `TrainingArguments`
+  - Use `gradient_checkpointing=True` to save GPU memory
+  - Set a reasonable `learning_rate`
+  - Use `output_dir=output_dir`, `logging_dir=output_dir`, `report_to="tensorboard"` to create a
+    tensorboard log and checkpoints in `output_dir`
+  - You shouldn't have to train for more than 5 `num_train_epochs` with a `per_device_train_batch_size=32`
+- A `TokenizedDataset`. We provide significant part of the tokenization starter code here.
+
+Finally, call `Trainer.train` to train the model.
+
+Either write a script that moves the final checkpoint in the correct directory or call `Trainer.save` to write the model to the `homework/sft_model` directory.
+
+Train your model with
+
+```bash
+python -m homework.sft train
+```
+
+and make sure it can be loaded by the grader
+
+```bash
+python -m homework.sft train
+```
+
+## Rejection sampling Fine-Tuning (25 pts)
+
+Finally, we implement a very basic RL algorithm to improve the reasoning capabilities of our LLM.
+The above SFT experiment produced straight up `<answer>...</answer>` outputs without first thinking about how to convert units.
+RFT will combine strengths of both Chain-of-Thought reasoning and SFT.
+
+RFT (Yuan etal. 2023, https://arxiv.org/abs/2308.01825) uses an offline procedure to create chain-of-thought-based answers.
+They start with a pre-trained LLM and in-context learning to create a new dataset of correct question / reasoning / answer tuples.
+We will implement this in `datagen.py`.
+Specifically, implement `generate_dataset` to produce 10 - 20 different completions from your `CoTModel`, then select the one with the correct answer, and add it to a dataset.
+If none of the answer is correct, ignore that data point.
+
+You should use the `CoTModel.batched_generate` function with `num_return_sequences > 1` and `temperature > 0` to produce a number of diverse outputs.
+Using the `HuggingFaceTB/SmolLM2-1.7B-Instruct` model should further help you obtain better rollouts.
+In our experiments, we had a 90+% success rate in generating this dataset (success = > 1 / 10 samples answered correctly).
+Store the output in a json file in `data/rft.json`.
+Here is a sample entry
+
+```json
+  [
+    "How many gram are there per 6 kg?",
+    6000.0,
+    "1 kg = 1000 grams. 6 * 1000 = <answer>6000</answer>"
+  ],
+```
+
+Modify your SFT code to train on this new data of question + reasoning pairs.
+
+This model will likely perform better than SFT, but might need a slightly larger LoRA adapter.
+Feel free to increase the rank as long as your total submission size is below 50Mb.
 
 ## Submission
 
@@ -211,7 +161,9 @@ Once you finished the assignment, create a submission bundle using:
 python3 bundle.py homework [YOUR UT ID]
 ```
 
-Submit the zip file on Canvas. Please note that the maximum file size our grader accepts is **20MB**. Please keep your solution compact.
+Delete any old checkpoints from your homework directory to keep the model size below 50MB.
+
+Submit the zip file on Canvas. Please note that the maximum file size our grader accepts is **50MB**. Please keep your solution compact.
 Please double-check that your zip file was properly created, by grading it again:
 
 ```bash

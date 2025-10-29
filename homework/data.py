@@ -1,48 +1,63 @@
+import json
+from dataclasses import dataclass
 from pathlib import Path
 
-import torch
-from PIL import Image
+from .base_llm import BaseLLM
 
-DATASET_PATH = Path(__file__).parent.parent / "data"
-
-
-class ImageDataset:
-    image_paths: list[Path]
-    _image_cache: list[torch.Tensor | None]
-    _cache_images: bool
-
-    def __init__(self, split: str, cache_images: bool = True):
-        self.image_paths = list((DATASET_PATH / split).rglob("*.jpg"))
-        self._image_cache = [None] * len(self.image_paths)
-        self._cache_images = cache_images
-
-    def __len__(self) -> int:
-        return len(self.image_paths)
-
-    def __getitem__(self, idx: int) -> torch.Tensor:
-        import numpy as np
-
-        cached_image = self._image_cache[idx]
-        if cached_image is not None:
-            return cached_image
-
-        img = torch.tensor(np.array(Image.open(self.image_paths[idx])), dtype=torch.uint8)
-        if self._cache_images:
-            self._image_cache[idx] = img
-        return img
+DATA_DIR = Path(__file__).parent.parent / "data"
 
 
-class TokenDataset(torch.utils.data.TensorDataset):
+class Dataset:
     def __init__(self, split: str):
-        tensor_path = DATASET_PATH / f"tokenized_{split}.pth"
-        if not tensor_path.exists():
-            raise FileNotFoundError(
-                f"Tokenized dataset not found at {tensor_path}. Create it following the assignment instructions."
-            )
-        self.data = torch.load(tensor_path, weights_only=False)
+        with (DATA_DIR / f"{split}.json").open() as f:
+            self.data = json.load(f)
 
-    def __getitem__(self, idx: int) -> torch.Tensor:
-        return torch.tensor(self.data[idx], dtype=torch.long)
-
-    def __len__(self) -> int:
+    def __len__(self):
         return len(self.data)
+
+    def __getitem__(self, idx: int):
+        return self.data[idx]
+
+
+def is_answer_valid(answer: float, correct_answer: float, relative_tolerance: float = 0.05) -> bool:
+    return abs(round(answer, 3) - round(correct_answer, 3)) < relative_tolerance * abs(round(correct_answer, 3))
+
+
+@dataclass
+class BenchmarkResult:
+    @dataclass
+    class Sample:
+        question: str
+        answer: float
+        correct_answer: float
+        is_correct: bool
+
+    accuracy: float
+    answer_rate: float  # How often was the answer not NaN
+    samples: list[Sample]
+
+    @classmethod
+    def from_answers(cls, answers: list[float], dataset: Dataset, max_question: int) -> "BenchmarkResult":
+        samples = [
+            cls.Sample(
+                question=item[0], answer=answer, correct_answer=item[1], is_correct=is_answer_valid(answer, item[1])
+            )
+            for item, answer in zip(dataset, answers[:max_question])
+        ]
+        n = min(len(dataset), max_question)
+        return cls(
+            accuracy=sum(sample.is_correct for sample in samples) / n,
+            answer_rate=sum(sample.answer == sample.answer for sample in samples) / n,
+            samples=samples,
+        )
+
+
+def benchmark(func: BaseLLM, dataset: Dataset, max_question: int) -> BenchmarkResult:
+    idx = range(min(len(dataset), max_question))
+    questions = [dataset[i][0] for i in idx]
+    answers = func.answer(*questions)
+    return BenchmarkResult.from_answers(answers, dataset, max_question)
+
+
+if __name__ == "__main__":
+    print(Dataset("train")[0])
