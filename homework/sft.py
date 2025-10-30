@@ -4,7 +4,6 @@ from .data import Dataset, benchmark
 
 def load() -> BaseLLM:
     from pathlib import Path
-
     from peft import PeftModel
 
     model_name = "sft_model"
@@ -19,11 +18,8 @@ def load() -> BaseLLM:
 
 def tokenize(tokenizer, question: str, answer: str):
     """
-    Tokenize a data element.
-    We first append the <EOS> token to the question / answer pair.
-    Then we tokenize and construct the ground truth `labels`.
-    `labels[i] == -100` for the question or masked out parts, since we only want to supervise
-    the answer.
+    Tokenize a question/answer pair and produce labels.
+    Only the answer portion is supervised (question tokens -> label = -100).
     """
     full_text = f"{question} {answer}{tokenizer.eos_token}"
 
@@ -34,7 +30,7 @@ def tokenize(tokenizer, question: str, answer: str):
     input_ids = full["input_ids"]
     question_len = len(tokenizer(question)["input_ids"])
 
-    # Create labels: mask out the prompt part
+    # Mask prompt part (no loss)
     labels = [-100] * question_len + input_ids[question_len:]
 
     for i in range(len(labels)):
@@ -47,21 +43,27 @@ def tokenize(tokenizer, question: str, answer: str):
 
 def format_example(prompt: str, answer: str) -> dict[str, str]:
     """
-    Construct a question / answer pair. Consider rounding the answer to make it easier for the LLM.
+    Construct a formatted prompt/answer pair suitable for fine-tuning.
+    Adds reasoning guidance and <answer></answer> tags to standardize output.
     """
-    raise NotImplementedError()
+    # Round numeric answers for stability
+    try:
+        ans = round(float(answer), 3)
+        answer_str = f"<answer>{ans}</answer>"
+    except ValueError:
+        answer_str = f"<answer>{answer}</answer>"
+
+    question = (
+        "You are a helpful reasoning assistant.\n"
+        f"Question: {prompt}\n"
+        "Think step by step and provide the numeric answer inside <answer> tags."
+    )
+
+    return {"question": question, "answer": answer_str}
 
 
 class TokenizedDataset:
     def __init__(self, tokenizer, data: Dataset, format_fn):
-        """
-        Use the
-        - BaseLLM.tokenizer
-        - Dataset
-        - format_fn which converts a data element into a dict with entries
-          - question: str
-          - answer: str
-        """
         self.format_fn = format_fn
         self.tokenizer = tokenizer
         self.data = data
@@ -70,15 +72,68 @@ class TokenizedDataset:
         return len(self.data)
 
     def __getitem__(self, idx):
-        formated_data = self.format_fn(*self.data[idx])
-        return tokenize(self.tokenizer, **formated_data)
+        formatted = self.format_fn(*self.data[idx])
+        return tokenize(self.tokenizer, **formatted)
 
 
-def train_model(
-    output_dir: str,
-    **kwargs,
-):
-    raise NotImplementedError()
+def train_model(output_dir: str, **kwargs):
+    """
+    Fine-tune the base LLM using LoRA with PEFT.
+    """
+    import torch
+    from torch.utils.data import DataLoader
+    from peft import LoraConfig, get_peft_model
+    from transformers import AdamW, get_linear_schedule_with_warmup
+
+    # Load base model
+    llm = BaseLLM()
+    model = llm.model
+    tokenizer = llm.tokenizer
+    device = llm.device
+
+    # LoRA config
+    lora_config = LoraConfig(
+        r=8,
+        lora_alpha=16,
+        target_modules=["q_proj", "v_proj"],  # works well for transformer-based LLMs
+        lora_dropout=0.05,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+
+    model = get_peft_model(model, lora_config).to(device)
+    model.train()
+
+    # Dataset
+    trainset = Dataset("train")
+    tokenized_train = TokenizedDataset(tokenizer, trainset, format_example)
+    dataloader = DataLoader(tokenized_train, batch_size=8, shuffle=True)
+
+    optimizer = AdamW(model.parameters(), lr=2e-5)
+    total_steps = len(dataloader) * 3  # 3 epochs default
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer, num_warmup_steps=0.1 * total_steps, num_training_steps=total_steps
+    )
+
+    for epoch in range(3):
+        total_loss = 0
+        for batch in dataloader:
+            batch = {k: v.to(device) for k, v in batch.items()}
+            outputs = model(**batch)
+            loss = outputs.loss
+
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
+            total_loss += loss.item()
+
+        print(f"Epoch {epoch + 1}: avg_loss={total_loss / len(dataloader):.4f}")
+
+    # Save the LoRA adapter
+    model.save_pretrained(output_dir)
+    print(f"Saved LoRA model to {output_dir}")
+
     test_model(output_dir)
 
 
@@ -86,7 +141,6 @@ def test_model(ckpt_path: str):
     testset = Dataset("valid")
     llm = BaseLLM()
 
-    # Load the model with LoRA adapters
     from peft import PeftModel
 
     llm.model = PeftModel.from_pretrained(llm.model, ckpt_path).to(llm.device)
