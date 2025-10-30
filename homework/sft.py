@@ -46,7 +46,6 @@ def format_example(prompt: str, answer: str) -> dict[str, str]:
     Construct a formatted prompt/answer pair suitable for fine-tuning.
     Adds reasoning guidance and <answer></answer> tags to standardize output.
     """
-    # Round numeric answers for stability
     try:
         ans = round(float(answer), 3)
         answer_str = f"<answer>{ans}</answer>"
@@ -83,7 +82,8 @@ def train_model(output_dir: str, **kwargs):
     import torch
     from torch.utils.data import DataLoader
     from peft import LoraConfig, get_peft_model
-    from transformers import AdamW, get_linear_schedule_with_warmup
+    from torch.optim import AdamW  # FIXED for Transformers 5.x
+    from transformers import get_linear_schedule_with_warmup
 
     # Load base model
     llm = BaseLLM()
@@ -95,7 +95,7 @@ def train_model(output_dir: str, **kwargs):
     lora_config = LoraConfig(
         r=8,
         lora_alpha=16,
-        target_modules=["q_proj", "v_proj"],  # works well for transformer-based LLMs
+        target_modules=["q_proj", "v_proj"],
         lora_dropout=0.05,
         bias="none",
         task_type="CAUSAL_LM",
@@ -110,9 +110,9 @@ def train_model(output_dir: str, **kwargs):
     dataloader = DataLoader(tokenized_train, batch_size=8, shuffle=True)
 
     optimizer = AdamW(model.parameters(), lr=2e-5)
-    total_steps = len(dataloader) * 3  # 3 epochs default
+    total_steps = len(dataloader) * 3  # 3 epochs
     scheduler = get_linear_schedule_with_warmup(
-        optimizer, num_warmup_steps=0.1 * total_steps, num_training_steps=total_steps
+        optimizer, num_warmup_steps=int(0.1 * total_steps), num_training_steps=total_steps
     )
 
     for epoch in range(3):
