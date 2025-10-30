@@ -1,12 +1,12 @@
 from .base_llm import BaseLLM
 from .sft import format_example, tokenize as sft_tokenize
-from pathlib import Path
-import json
 import torch
 from torch.utils.data import DataLoader
-from transformers import get_linear_schedule_with_warmup
 from torch.optim import AdamW
+from transformers import get_linear_schedule_with_warmup
 from peft import LoraConfig, get_peft_model
+from pathlib import Path
+import json
 
 
 def load() -> BaseLLM:
@@ -23,24 +23,24 @@ def load() -> BaseLLM:
 
 
 class RFTDataset(torch.utils.data.Dataset):
-    def __init__(self, entries, tokenizer):
-        """
-        entries: list of [question:str, numeric_answer:float, reasoning_text:str]
-        """
-        self.entries = entries
+    def __init__(self, tokenizer, rft_json_path: str):
+        with open(rft_json_path, "r", encoding="utf-8") as f:
+            entries = json.load(f)  # [question, numeric_answer, reasoning_text]
+
+        # Each entry is a (prompt, answer) pair
+        self.pairs = [(q, reasoning) for q, num, reasoning in entries]
         self.tokenizer = tokenizer
 
     def __len__(self):
-        return len(self.entries)
+        return len(self.pairs)
 
     def __getitem__(self, idx):
-        q, num, reasoning = self.entries[idx]
-        # reasoning_text already contains <answer> tags
-        formatted = format_example(q, reasoning)
+        q, ans = self.pairs[idx]
+        formatted = format_example(q, ans)
         return sft_tokenize(self.tokenizer, **formatted)
 
 
-def collate_fn(batch):
+def collate_batch(batch):
     return {k: torch.tensor([d[k] for d in batch]) for k in batch[0]}
 
 
@@ -52,27 +52,20 @@ def train_model(
     lr: float = 2e-5,
     **kwargs,
 ):
-    """
-    Train LoRA adapters on the RFT dataset (question + chain-of-thought reasoning).
-    """
-
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load base model + tokenizer
+    # Load model and tokenizer
     llm = BaseLLM()
     model = llm.model
     tokenizer = llm.tokenizer
     device = llm.device
 
-    # Load RFT data
-    with open(rft_json_path, "r", encoding="utf-8") as f:
-        entries = json.load(f)
+    # Load RFT dataset
+    dataset = RFTDataset(tokenizer, rft_json_path)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_batch)
 
-    dataset = RFTDataset(entries, tokenizer)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
-
-    # LoRA config (slightly larger than SFT)
+    # LoRA config
     lora_config = LoraConfig(
         r=16,
         lora_alpha=32,
@@ -81,16 +74,13 @@ def train_model(
         bias="none",
         task_type="CAUSAL_LM",
     )
-
     model = get_peft_model(model, lora_config).to(device)
     model.train()
 
     optimizer = AdamW(model.parameters(), lr=lr)
     total_steps = len(dataloader) * epochs if len(dataloader) > 0 else 1
     scheduler = get_linear_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=int(0.1 * total_steps),
-        num_training_steps=total_steps
+        optimizer, num_warmup_steps=int(0.1 * total_steps), num_training_steps=total_steps
     )
 
     for epoch in range(epochs):
@@ -107,12 +97,10 @@ def train_model(
         avg = total_loss / (len(dataloader) if len(dataloader) > 0 else 1)
         print(f"Epoch {epoch + 1}/{epochs} avg_loss={avg:.4f}")
 
-    # Save LoRA adapter
     model.save_pretrained(output_dir)
     print(f"Saved RFT LoRA adapter to {output_dir}")
 
 
 if __name__ == "__main__":
     from fire import Fire
-
     Fire({"train": train_model, "load": load})
