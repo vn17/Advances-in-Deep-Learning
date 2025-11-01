@@ -1,3 +1,4 @@
+import torch
 from .base_llm import BaseLLM
 from .data import Dataset, benchmark
 from torch.optim import AdamW
