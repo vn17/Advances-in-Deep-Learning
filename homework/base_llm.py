@@ -19,6 +19,7 @@ class BaseLLM:
         return question
 
     def parse_answer(self, answer: str) -> float:
+        print("\n-------ANS-------\n" + answer + "\n--------DONE------\n")
         try:
             return float(answer.split("<answer>")[1].split("</answer>")[0])
         except (IndexError, ValueError):
@@ -40,8 +41,8 @@ class BaseLLM:
         ...
 
     def batched_generate(
-        self, prompts: list[str], num_return_sequences: int | None = None, temperature: float = 0
-    ) -> list[str] | list[list[str]]:
+    self, prompts: list[str], num_return_sequences: int | None = None, temperature: float = 0
+) -> list[str] | list[list[str]]:
         micro_batch_size = 32
 
         if len(prompts) > micro_batch_size:
@@ -58,6 +59,7 @@ class BaseLLM:
 
         # --- Tokenize ---
         inputs = self.tokenizer(prompts, padding=True, return_tensors="pt").to(self.device)
+        input_length = inputs['input_ids'].shape[1]  # Store the input length
 
         # --- Generation settings ---
         do_sample = temperature > 0
@@ -74,8 +76,10 @@ class BaseLLM:
                 pad_token_id=self.tokenizer.pad_token_id,
             )
 
-        # --- Decode outputs ---
-        decoded = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
+        # --- Decode only the NEW tokens (exclude the prompt) ---
+        # Slice from input_length onwards to get only generated tokens
+        new_tokens = outputs[:, input_length:]
+        decoded = self.tokenizer.batch_decode(new_tokens, skip_special_tokens=True)
 
         # If multiple return sequences requested, reshape
         if num_return_sequences > 1:

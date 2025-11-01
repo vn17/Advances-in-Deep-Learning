@@ -1,30 +1,42 @@
-from .base_llm import BaseLLM
+from homework.base_llm import BaseLLM  # use absolute import to avoid relative import errors
 
 
 class CoTModel(BaseLLM):
     def format_prompt(self, question: str) -> str:
         """
-        Convert a raw question into a chat-style prompt suitable for an
-        instruction-tuned LLM (e.g., SmolLM2-Instruct).
-        We explicitly ask the model to reason step-by-step and provide
-        the final numeric answer enclosed in <answer></answer> tags.
+        Format prompt using Chain-of-Thought:
+        - Give the model an example reasoning chain
+        - Then ask the actual question with clear instructions
+        - Always end with <answer>NUMBER</answer>
         """
+        # Example reasoning question and answer
+        example_q = "If a box has 3 red balls and 2 blue balls, how many total balls are there?"
+        example_a = "There are 3 red + 2 blue = 5 total balls.\n<answer>5</answer>"
 
-        # Construct a chat conversation list as expected by apply_chat_template
         messages = [
-            {"role": "system", "content": "You are a helpful assistant that reasons step by step."},
+            {
+                "role": "system",
+                "content": (
+                    "You are a concise reasoning assistant. "
+                    "Show step-by-step reasoning briefly, then output only the numeric answer "
+                    "in <answer> tags, e.g. <answer>42</answer>."
+                ),
+            },
+            {"role": "user", "content": example_q},
+            {"role": "assistant", "content": example_a},
             {
                 "role": "user",
                 "content": (
                     f"{question}\n\n"
-                    "Think carefully step by step. "
-                    "At the end, output your final numeric answer between <answer> and </answer> tags."
+                    "Reason step by step, then end your reply with the final numeric answer "
+                    "inside <answer> tags. Do not include units or extra text."
                 ),
             },
         ]
 
-        # Convert the messages into a single prompt string using the model's chat template
-        prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        prompt = self.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
         return prompt
 
 
@@ -33,7 +45,7 @@ def load() -> CoTModel:
 
 
 def test_model():
-    from .data import Dataset, benchmark
+    from homework.data import Dataset, benchmark
 
     testset = Dataset("valid")
     model = CoTModel()
@@ -43,5 +55,4 @@ def test_model():
 
 if __name__ == "__main__":
     from fire import Fire
-
     Fire({"test": test_model, "load": load})
