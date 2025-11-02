@@ -132,7 +132,7 @@ def train_model(output_dir: str = "sft_model", **kwargs):
     )
 
     # Optimizer and scheduler
-    optimizer = AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
+    optimizer = AdamW(model.parameters(), lr=1e-3, weight_decay=0.01)
     num_epochs = 5  # More epochs
     total_steps = len(dataloader) * num_epochs
     scheduler = get_linear_schedule_with_warmup(
