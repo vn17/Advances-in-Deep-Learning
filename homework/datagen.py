@@ -2,7 +2,7 @@ from pathlib import Path
 import json
 from tqdm import tqdm
 
-from .cot_model import CoTModel
+from .cot import CoTModel
 from .data import Dataset
 
 
