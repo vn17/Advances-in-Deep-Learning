@@ -27,13 +27,13 @@ def _is_close(a: float, b: float, rel_tol: float = 1e-3, abs_tol: float = 1e-3) 
         return False
 
 
-def generate_dataset(output_json: str, oversample: int = 10, temperature: float = 0.6):
+def generate_dataset(output_json: str = "data/rft.json", oversample: int = 30, temperature: float = 0.8):
     """
     Generate an RFT dataset using rejection sampling.
 
     For each example in Dataset('train'):
       - use CoTModel.batched_generate() with num_return_sequences = oversample
-      - pick the first completion whose <answer> matches ground truth
+      - pick the best completion whose <answer> matches ground truth
       - save [question, answer, reasoning_text] to output_json
 
     Args:
@@ -45,7 +45,10 @@ def generate_dataset(output_json: str, oversample: int = 10, temperature: float 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     ds = Dataset("train")
-    model = CoTModel()
+    
+    # Use the larger 1.7B model for better quality reasoning chains
+    print("Loading HuggingFaceTB/SmolLM2-1.7B-Instruct for high-quality CoT generation...")
+    model = CoTModel(checkpoint="HuggingFaceTB/SmolLM2-1.7B-Instruct")
 
     accepted = []
 
@@ -66,20 +69,24 @@ def generate_dataset(output_json: str, oversample: int = 10, temperature: float 
         if isinstance(generations, list) and len(generations) == 1 and isinstance(generations[0], list):
             generations = generations[0]
 
-        chosen = None
+        # Find ALL correct completions, then pick the best one
+        correct_completions = []
         for g in generations:
             pred_val = _parse_answer_text(g)
             if pred_val is not None and _is_close(pred_val, true_val):
-                chosen = g
-                break
+                correct_completions.append(g)
 
-        if chosen:
+        # Pick the completion with the most detailed reasoning (longest by word count)
+        if correct_completions:
+            chosen = max(correct_completions, key=lambda x: len(x.split()))
             accepted.append([question, true_val, chosen])
 
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(accepted, f, indent=2, ensure_ascii=False)
 
-    print(f"✅ Saved {len(accepted)} RFT examples to {output_path}")
+    success_rate = len(accepted) / len(ds) * 100 if len(ds) > 0 else 0
+    print(f"✅ Saved {len(accepted)}/{len(ds)} RFT examples to {output_path}")
+    print(f"Success rate: {success_rate:.1f}%")
     return len(accepted)
 
 
