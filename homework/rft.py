@@ -59,7 +59,7 @@ def collate_batch(batch):
 def train_model(
     output_dir: str = "rft_model",
     rft_json_path: str = "data/rft.json",
-    epochs: int = 3,  # More epochs
+    epochs: int = 5,  # More epochs
     batch_size: int = 2,  # Smaller batch for more updates
     lr: float = 3e-4,  # Lower LR for stability
     **kwargs,
