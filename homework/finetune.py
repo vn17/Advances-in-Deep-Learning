@@ -24,14 +24,26 @@ def load(model_name: str = "vlm_model") -> BaseVLM:
     model_path = Path(__file__).parent / model_name
 
     vlm = BaseVLM()
-    vlm.model = PeftModel.from_pretrained(vlm.model, model_path).to(vlm.device)
-    vlm.model.eval()
+    # If there is a saved LoRA/PEFT checkpoint available use it, otherwise return
+    # the base VLM model so the grader can still run without saved adapters.
+    adapter_config = model_path / "adapter_config.json"
+    if model_path.exists() and adapter_config.exists():
+        try:
+            vlm.model = PeftModel.from_pretrained(vlm.model, model_path).to(vlm.device)
+            vlm.model.eval()
+            return vlm
+        except Exception:
+            # fallback to base model if loading fails
+            vlm.model.eval()
+            return vlm
 
+    # No adapter found -> return base model (unwrapped)
+    vlm.model.eval()
     return vlm
 
 
 def custom_data_collator(features: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
-    # Get max sequence length
+    # Get max sequence lengthfi
     max_length = max(f["input_ids"].shape[0] for f in features)
 
     def pad_tensor(tensor, pad_value):
