@@ -101,14 +101,48 @@ class CLIP(nn.Module):
         super().__init__()
         self.vision_encoder = vision_encoder
         self.text_encoder = text_encoder
-        # TODO: implement the rest components
-        raise NotImplementedError("Not implemented")
+        # projection heads for vision and text
+        # We'll infer hidden dims lazily on first forward pass, so create placeholders
+        self.proj_dim = proj_dim
+        self._vision_proj = None
+        self._text_proj = None
+
+        # temperature (use learnable log-temp)
+        self.log_temp = nn.Parameter(torch.tensor(float(torch.log(torch.tensor(1.0 / temperature))), dtype=torch.float32))
+
+    def _lazy_init_projections(self, vision_feat: torch.Tensor, text_feat: torch.Tensor):
+        # vision_feat: (B, ..., Dv) -> take last dim
+        dv = vision_feat.shape[-1]
+        dt = text_feat.shape[-1]
+        if self._vision_proj is None:
+            self._vision_proj = nn.Linear(dv, self.proj_dim)
+            # register so parameters show up
+            self.add_module("vision_projection", self._vision_proj)
+        if self._text_proj is None:
+            self._text_proj = nn.Linear(dt, self.proj_dim)
+            self.add_module("text_projection", self._text_proj)
 
     def encode_image(self, image: torch.Tensor) -> torch.Tensor:
-        return self.vision_encoder(image)
+        out = self.vision_encoder(image)
+        # prefer pooler_output if present
+        if hasattr(out, "pooler_output") and out.pooler_output is not None:
+            return out.pooler_output
+        if hasattr(out, "last_hidden_state") and out.last_hidden_state is not None:
+            # mean pool
+            return out.last_hidden_state.mean(dim=1)
+
+        # fallback
+        return out
 
     def encode_text(self, text: str) -> torch.Tensor:
-        return self.text_encoder(text)
+        out = self.text_encoder(input_ids=text) if not isinstance(text, dict) else self.text_encoder(**text)
+        if hasattr(out, "pooler_output") and out.pooler_output is not None:
+            return out.pooler_output
+        if hasattr(out, "last_hidden_state") and out.last_hidden_state is not None:
+            # We expect text inputs to be token-level outputs; pool with attention if provided
+            return out.last_hidden_state.mean(dim=1)
+
+        return out
 
     def save_pretrained(self, save_directory: str, **kwargs):
         """Customize save method, save additional parameters"""
@@ -180,7 +214,55 @@ class CLIP(nn.Module):
         Returns:
             TODO: think about the what values should be returned
         """
-        raise NotImplementedError("Not implemented")
+        # pixel_values: (B, C, H, W) or (B, ...)
+        # input_ids: either (N, L) where N == B (paired) or N may be > B (multi-candidates)
+
+        # Encode images
+        vision_out = self.vision_encoder(pixel_values)
+        if hasattr(vision_out, "pooler_output") and vision_out.pooler_output is not None:
+            vfeat = vision_out.pooler_output
+        elif hasattr(vision_out, "last_hidden_state") and vision_out.last_hidden_state is not None:
+            vfeat = vision_out.last_hidden_state.mean(dim=1)
+        else:
+            vfeat = vision_out
+
+        # Encode texts
+        # If attention_mask provided, call text_encoder with tensors
+        if isinstance(input_ids, torch.Tensor):
+            text_out = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)
+        else:
+            # assume dict-like (already prepared)
+            text_out = self.text_encoder(**input_ids)
+
+        if hasattr(text_out, "pooler_output") and text_out.pooler_output is not None:
+            tfeat = text_out.pooler_output
+        elif hasattr(text_out, "last_hidden_state") and text_out.last_hidden_state is not None:
+            # mean pool using attention mask if available
+            if attention_mask is not None:
+                mask = attention_mask.float().unsqueeze(-1)
+                tfeat = (text_out.last_hidden_state * mask).sum(dim=1) / (mask.sum(dim=1).clamp(min=1e-9))
+            else:
+                tfeat = text_out.last_hidden_state.mean(dim=1)
+        else:
+            tfeat = text_out
+
+        # lazy init projection layers
+        self._lazy_init_projections(vfeat, tfeat)
+
+        vproj = self._vision_proj(vfeat)
+        tproj = self._text_proj(tfeat)
+
+        # normalize
+        vnorm = vproj / (vproj.norm(dim=-1, keepdim=True).clamp(min=1e-9))
+        tnorm = tproj / (tproj.norm(dim=-1, keepdim=True).clamp(min=1e-9))
+
+        # temperature
+        temperature = torch.exp(-self.log_temp)
+
+        # logits: (num_images, num_texts)
+        logits = torch.matmul(vnorm, tnorm.T) / temperature
+
+        return vnorm, tnorm, logits
 
 
 def compute_clip_loss(
@@ -199,7 +281,24 @@ def compute_clip_loss(
     Returns:
         The loss for the CLIP model.
     """
-    raise NotImplementedError("Not implemented")
+    # outputs: (vision_feat, text_feat, logits)
+    if not isinstance(outputs, (list, tuple)) or len(outputs) < 3:
+        raise ValueError("Expected outputs tuple (vfeat, tfeat, logits)")
+
+    _, _, logits = outputs
+
+    # If logits is 2D square and we assume i-th image matches i-th text
+    device = logits.device
+    n_i, n_t = logits.shape
+
+    labels_idx = torch.arange(n_i, device=device)
+
+    # image-to-text loss
+    loss_i2t = nn.functional.cross_entropy(logits, labels_idx)
+    # text-to-image loss
+    loss_t2i = nn.functional.cross_entropy(logits.T, labels_idx)
+
+    return (loss_i2t + loss_t2i) / 2.0
 
 
 def get_target_modules_for_lora(model: nn.Module) -> list[str]:

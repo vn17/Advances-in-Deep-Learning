@@ -22,7 +22,43 @@ def generate_caption(info_path: str, view_index: int, img_width: int = 150, img_
     # 4. Relative position
     # {kart_name} is {position} of the ego car.
 
-    raise NotImplementedError("Not implemented")
+    # Reuse helpers from generate_qa
+    from .generate_qa import extract_kart_objects, extract_track_info
+
+    karts = extract_kart_objects(info_path, view_index, img_width, img_height)
+    track_name = extract_track_info(info_path)
+
+    captions = []
+    # Ego car
+    if karts:
+        ego = next((k for k in karts if k.get("is_center_kart")), karts[0])
+        captions.append(f"{ego['kart_name']} is the ego car.")
+    else:
+        captions.append("There is no ego car visible.")
+
+    # Counting
+    captions.append(f"There are {len(karts)} karts in the scene.")
+
+    # Track
+    captions.append(f"The track is {track_name}.")
+
+    # Relative positions for a few karts
+    if karts and len(karts) > 1:
+        ego = next((k for k in karts if k.get("is_center_kart")), karts[0])
+        ex, ey = ego["center"]
+        added = 0
+        for k in karts:
+            if k is ego:
+                continue
+            x, y = k["center"]
+            lr = "left" if x < ex else "right"
+            fb = "front" if y < ey else "behind"
+            captions.append(f"{k['kart_name']} is {fb} and to the {lr} of the ego car.")
+            added += 1
+            if added >= 3:
+                break
+
+    return captions
 
 
 def check_caption(info_file: str, view_index: int):
