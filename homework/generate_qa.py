@@ -136,30 +136,17 @@ def extract_kart_objects(
 ) -> list:
     """
     Extract kart objects from the info.json file, including their center points and identify the center kart.
-    Filters out karts that are out of sight (outside the image boundaries).
-
-    Args:
-        info_path: Path to the corresponding info.json file
-        view_index: Index of the view to analyze
-        img_width: Width of the image (default: 150)
-        img_height: Height of the image (default: 100)
-
-    Returns:
-        List of kart objects, each containing:
-        - instance_id: The track ID of the kart
-        - kart_name: The name of the kart
-        - center: (x, y) coordinates of the kart's center
-        - is_center_kart: Boolean indicating if this is the kart closest to image center
     """
-
     with open(info_path) as f:
         info = json.load(f)
 
-    detections = []
     if "detections" not in info or view_index >= len(info["detections"]):
         return []
 
     frame_detections = info["detections"][view_index]
+    
+    # Get kart names list
+    kart_names = info.get("karts", [])
 
     cart_list = []
     for det in frame_detections:
@@ -189,17 +176,15 @@ def extract_kart_objects(
         if cx < 0 or cy < 0 or cx > img_width or cy > img_height:
             continue
 
-        # Kart name mapping if present
-        kart_name = None
-        # Many info jsons store names in a dict 'kart_names' or 'names'
-        if "kart_names" in info:
-            kart_name = info["kart_names"].get(str(track_id)) if isinstance(info["kart_names"], dict) else None
-        if kart_name is None and "names" in info:
-            kart_name = info["names"].get(str(track_id)) if isinstance(info["names"], dict) else None
-        if kart_name is None:
-            kart_name = f"kart_{track_id}"
+        # Get kart name from list using track_id as index
+        kart_name = kart_names[track_id] if track_id < len(kart_names) else f"kart_{track_id}"
 
-        cart_list.append({"instance_id": track_id, "kart_name": kart_name, "center": (cx, cy), "bbox": (x1, y1, x2, y2)})
+        cart_list.append({
+            "instance_id": track_id, 
+            "kart_name": kart_name, 
+            "center": (cx, cy), 
+            "bbox": (x1, y1, x2, y2)
+        })
 
     # determine center (ego) kart
     if not cart_list:
@@ -217,6 +202,75 @@ def extract_kart_objects(
 
     return cart_list
 
+
+# Add this function before the main() function:
+
+def generate(data_dir: str, output_file: str = None, num_views: int = 10):
+    """
+    Generate QA pairs for all info files in a directory.
+    
+    Args:
+        data_dir: Directory containing *_info.json files
+        output_file: Output JSON file path (default: data_dir/balanced_qa_pairs.json)
+        num_views: Number of views per frame (default: 10)
+    """
+    from tqdm import tqdm
+    
+    data_dir = Path(data_dir)
+    
+    if output_file is None:
+        output_file = data_dir / "balanced_qa_pairs.json"
+    else:
+        output_file = Path(output_file)
+    
+    # Find all info files
+    info_files = sorted(data_dir.glob("*_info.json"))
+    
+    if len(info_files) == 0:
+        print(f"❌ No *_info.json files found in {data_dir}")
+        return
+    
+    print(f"📁 Found {len(info_files)} info files in {data_dir}")
+    
+    all_qa_pairs = []
+    
+    # Process each info file and each view
+    for info_file in tqdm(info_files, desc="Generating QA pairs"):
+        try:
+            # First check how many views this file actually has
+            with open(info_file) as f:
+                info_data = json.load(f)
+            actual_num_views = len(info_data.get("detections", []))
+            
+            for view_idx in range(min(num_views, actual_num_views)):
+                # Check if image exists for this view
+                base_name = info_file.stem.replace("_info", "")
+                image_file = info_file.parent / f"{base_name}_{view_idx:02d}_im.jpg"
+                
+                if not image_file.exists():
+                    continue
+                
+                # Generate QA pairs for this view
+                qa_pairs = generate_qa_pairs(str(info_file), view_idx)
+                all_qa_pairs.extend(qa_pairs)
+                
+        except Exception as e:
+            print(f"\n⚠️  Error processing {info_file.name}: {e}")
+            continue
+    
+    # Save to JSON
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_file, 'w') as f:
+        json.dump(all_qa_pairs, f, indent=2)
+    
+    print(f"\n✅ Generated {len(all_qa_pairs)} QA pairs")
+    print(f"📝 Saved to: {output_file}")
+    print(f"\n📊 Statistics:")
+    print(f"   - Info files processed: {len(info_files)}")
+    print(f"   - Total QA pairs: {len(all_qa_pairs)}")
+    print(f"   - Avg QA pairs per file: {len(all_qa_pairs) / len(info_files):.1f}")
+    
+    return all_qa_pairs
 
 def extract_track_info(info_path: str) -> str:
     """
@@ -384,7 +438,10 @@ You probably need to add additional commands to Fire below.
 
 
 def main():
-    fire.Fire({"check": check_qa_pairs})
+    fire.Fire({
+        "check": check_qa_pairs,
+        "generate": generate,
+    })
 
 
 if __name__ == "__main__":
