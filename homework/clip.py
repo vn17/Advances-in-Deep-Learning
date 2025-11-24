@@ -20,7 +20,6 @@ device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is
 
 def load(model_name: str = "clip_model"):
     from pathlib import Path
-
     from peft import PeftModel
 
     model_path = Path(__file__).parent / model_name
@@ -28,33 +27,33 @@ def load(model_name: str = "clip_model"):
     vlm = BaseVLM()
     vision_encoder = vlm.model.model.vision_model
     text_encoder = vlm.model.model.text_model
-    # If a PEFT/LoRA checkpoint exists, load it. Otherwise return a plain CLIP
-    # instance wrapped similarly to the PEFT return object (with .model attr).
     clip_net = CLIP(vision_encoder, text_encoder)
     adapter_config = model_path / "adapter_config.json"
 
     if model_path.exists() and adapter_config.exists():
         try:
-            clip = PeftModel.from_pretrained(clip_net, model_path).to(device)
+            clip = PeftModel.from_pretrained(clip_net, model_path)
             # load additional projection weights if present
             try:
                 clip.model.load_pretrained(model_path)
             except Exception:
                 pass
+            
+            # CRITICAL: Move to device AFTER loading weights
+            clip = clip.to(device)
             clip.model.eval()
             if device == "cuda":
                 clip = clip.to(dtype=torch.bfloat16)
             return clip
         except Exception:
-            # fall back to returning a plain CLIP network
             pass
 
-    # No adapter available: return a simple wrapper with .model attribute to
-    # remain compatible with grader expectations.
+    # No adapter available: return a simple wrapper
     class _SimpleWrapper:
         def __init__(self, model):
             self.model = model
 
+    clip_net = clip_net.to(device)
     clip_net.eval()
     if device == "cuda":
         try:
@@ -140,12 +139,17 @@ class CLIP(nn.Module):
         # vision_feat: (B, ..., Dv) -> take last dim
         dv = vision_feat.shape[-1]
         dt = text_feat.shape[-1]
+        
+        # CRITICAL: Get device and dtype from existing model parameters, NOT from input
+        device = next(self.vision_encoder.parameters()).device
+        dtype = next(self.vision_encoder.parameters()).dtype
+        
         if self._vision_proj is None:
-            self._vision_proj = nn.Linear(dv, self.proj_dim)
+            self._vision_proj = nn.Linear(dv, self.proj_dim).to(device=device, dtype=dtype)
             # register so parameters show up
             self.add_module("vision_projection", self._vision_proj)
         if self._text_proj is None:
-            self._text_proj = nn.Linear(dt, self.proj_dim)
+            self._text_proj = nn.Linear(dt, self.proj_dim).to(device=device, dtype=dtype)
             self.add_module("text_projection", self._text_proj)
 
     def encode_image(self, image: torch.Tensor) -> torch.Tensor:
@@ -183,15 +187,17 @@ class CLIP(nn.Module):
 
     def load_pretrained(self, load_directory: str, **kwargs):
         """Customize load method, load projection additional parameters"""
-
         additional_weights_path = Path(load_directory) / "additional_weights.pt"
         if additional_weights_path.exists():
-            additional_state_dict = torch.load(additional_weights_path, map_location="cpu")
+            # Determine the device from existing parameters
+            device = next(self.parameters()).device
+            additional_state_dict = torch.load(additional_weights_path, map_location=device)
 
             for name, param in self.named_parameters():
                 if "vision_encoder." in name or "text_encoder." in name:
                     continue
-                param.data = additional_state_dict[name]
+                if name in additional_state_dict:
+                    param.data = additional_state_dict[name].to(device=device, dtype=param.dtype)
 
     def set_trainable_parameters(self):
         for name, param in self.named_parameters():
@@ -221,28 +227,22 @@ class CLIP(nn.Module):
         self.text_encoder.get_input_embeddings().register_forward_hook(make_inputs_require_grads)
 
     def forward(
-        self,
-        pixel_values: torch.Tensor,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor = None,
-        labels: torch.Tensor = None,
-        **kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    self,
+    pixel_values: torch.Tensor,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor = None,
+    labels: torch.Tensor = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Forward pass for the CLIP model.
-        Args:
-            pixel_values: The pixel values of the image.
-            input_ids: The input ids of the text.
-            attention_mask: The attention mask of the text.
-            labels: The labels for the text features.
-            (NOTE: you don't need to use the variable `labels`, this is just for compatibility with the Trainer class)
-            (Hint: refer to returned values of the __getitem__ method in the CaptionDatasetForTraining class)
-        Returns:
-            TODO: think about the what values should be returned
         """
-        # pixel_values: (B, C, H, W) or (B, ...)
-        # input_ids: either (N, L) where N == B (paired) or N may be > B (multi-candidates)
-
+        # Get the target dtype from model parameters
+        target_dtype = next(self.vision_encoder.parameters()).dtype
+        
+        # Ensure inputs match model dtype
+        pixel_values = pixel_values.to(dtype=target_dtype)
+        
         # Encode images
         vision_out = self.vision_encoder(pixel_values)
         if hasattr(vision_out, "pooler_output") and vision_out.pooler_output is not None:
@@ -253,17 +253,14 @@ class CLIP(nn.Module):
             vfeat = vision_out
 
         # Encode texts
-        # If attention_mask provided, call text_encoder with tensors
         if isinstance(input_ids, torch.Tensor):
             text_out = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)
         else:
-            # assume dict-like (already prepared)
             text_out = self.text_encoder(**input_ids)
 
         if hasattr(text_out, "pooler_output") and text_out.pooler_output is not None:
             tfeat = text_out.pooler_output
         elif hasattr(text_out, "last_hidden_state") and text_out.last_hidden_state is not None:
-            # mean pool using attention mask if available
             if attention_mask is not None:
                 mask = attention_mask.float().unsqueeze(-1)
                 tfeat = (text_out.last_hidden_state * mask).sum(dim=1) / (mask.sum(dim=1).clamp(min=1e-9))
@@ -271,6 +268,10 @@ class CLIP(nn.Module):
                 tfeat = text_out.last_hidden_state.mean(dim=1)
         else:
             tfeat = text_out
+
+        # Ensure features match model dtype
+        vfeat = vfeat.to(dtype=target_dtype)
+        tfeat = tfeat.to(dtype=target_dtype)
 
         # lazy init projection layers
         self._lazy_init_projections(vfeat, tfeat)
@@ -444,21 +445,22 @@ def test(ckpt_path: str, val_dataset: str = "valid_grader"):
     clip = load(ckpt_path)
     clip = clip.model.to(device)
 
-    image_processor = tv.transforms.Compose(
-        [
-            tv.transforms.Resize(192),
-            tv.transforms.CenterCrop(192),
-            tv.transforms.ToTensor(),
-            tv.transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-        ]
-    )
+    image_processor = tv.transforms.Compose([
+        tv.transforms.Resize(192),
+        tv.transforms.CenterCrop(192),
+        tv.transforms.ToTensor(),
+        tv.transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+    ])
 
     correct_count = 0
     total_count = 0
 
     for pair in tqdm.tqdm(testset):
         image = Image.open(pair["image_path"]).convert("RGB")
-        pixel_values = image_processor(image).unsqueeze(0).to(device).bfloat16()
+        pixel_values = image_processor(image).unsqueeze(0).to(device)
+        
+        # Don't manually convert dtype - let the model's forward() handle it
+        
         text_inputs = processor(
             text=[s + processor.tokenizer.eos_token for s in pair["candidates"]],
             return_tensors="pt",
@@ -467,14 +469,15 @@ def test(ckpt_path: str, val_dataset: str = "valid_grader"):
         )
         input_ids = text_inputs["input_ids"].long().to(device)
         attention_mask = text_inputs["attention_mask"].to(device)
+        
         vision_feature, text_feature, _ = clip(pixel_values, input_ids, attention_mask)
         prediction = torch.matmul(vision_feature, text_feature.T).argmax(dim=-1)
+        
         if prediction == pair["correct_index"]:
             correct_count += 1
         total_count += 1
 
     print(f"Accuracy: {correct_count / total_count}")
-
 
 def main():
     from fire import Fire

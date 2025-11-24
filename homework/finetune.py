@@ -43,21 +43,24 @@ def load(model_name: str = "vlm_model") -> BaseVLM:
 
 
 def custom_data_collator(features: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
-    # Get max sequence lengthfi
     max_length = max(f["input_ids"].shape[0] for f in features)
 
     def pad_tensor(tensor, pad_value):
-        return torch.cat([tensor, torch.full((max_length - tensor.shape[0],), pad_value, dtype=tensor.dtype)])
+        if tensor.shape[0] >= max_length:
+            return tensor
+        pad_size = max_length - tensor.shape[0]
+        # Pad on the left for decoder-only models
+        return torch.cat([torch.full((pad_size,), pad_value, dtype=tensor.dtype), tensor])
 
-    input_ids = torch.stack([pad_tensor(f["input_ids"], pad_value=processor.tokenizer.eos_token_id) for f in features])
+    input_ids = torch.stack([pad_tensor(f["input_ids"], pad_value=processor.tokenizer.pad_token_id) for f in features])
     attention_mask = torch.stack([pad_tensor(f["attention_mask"], pad_value=0) for f in features])
     labels = torch.stack([pad_tensor(f["labels"], pad_value=-100) for f in features])
-    pixel_values = torch.stack([f["pixel_values"] for f in features])  # assume all are same shape
+    pixel_values = torch.stack([f["pixel_values"] for f in features])
 
     return {
-        "input_ids": input_ids,
-        "attention_mask": attention_mask,
-        "labels": labels,
+        "input_ids": input_ids.long(),
+        "attention_mask": attention_mask.long(),
+        "labels": labels.long(),
         "pixel_values": pixel_values,
     }
 
@@ -67,10 +70,14 @@ class VQADatasetForTraining(Dataset):
         self.dataset = dataset
         self.processor = processor
         self.features = ["image", "question", "answer"]
+        
+        # Ensure tokenizer has pad token set
+        if self.processor.tokenizer.pad_token is None:
+            self.processor.tokenizer.pad_token = self.processor.tokenizer.eos_token
+        
         self.image_token_id = self.processor.tokenizer.additional_special_tokens_ids[
             self.processor.tokenizer.additional_special_tokens.index("<image>")
         ]
-        self.processor.tokenizer.pad_token = self.processor.tokenizer.eos_token
 
     def __len__(self):
         return len(self.dataset)
@@ -78,39 +85,38 @@ class VQADatasetForTraining(Dataset):
     def __getitem__(self, idx: int) -> dict:
         item = self.dataset[idx]
         image = Image.open(item["image_path"]).convert("RGB")
+        
         # Prepare input text in chat format
         input_message = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": item["question"]}]}]
         prompt = self.processor.apply_chat_template(input_message, add_generation_prompt=True)
-        full_text = prompt + item["answer"]  # append the answer to the prompt
-
+        
+        # Process prompt separately to get accurate token length
+        prompt_inputs = self.processor(
+            images=image,
+            text=prompt,
+            return_tensors="pt",
+            padding=False,
+            truncation=True,
+        )
+        prompt_len = prompt_inputs["input_ids"].shape[1]
+        
+        # Process full text (prompt + answer + EOS)
+        full_text = prompt + item["answer"] + self.processor.tokenizer.eos_token
         inputs = self.processor(
             images=image,
             text=full_text,
             return_tensors="pt",
-            padding=True,
+            padding=False,
             truncation=True,
-            padding_side="left",
         )
 
         input_ids = inputs["input_ids"].squeeze(0)
         attention_mask = inputs["attention_mask"].squeeze(0)
 
-        # Get answer length
-        answer_ids = self.processor(
-            images=None, text=item["answer"], return_tensors="pt", truncation=True
-        ).input_ids.squeeze(0)
-        answer_len = len(answer_ids)
-
-        # Prepare labels: mask everything except the answer tokens
+        # Prepare labels: mask prompt tokens, keep only answer tokens for loss
         labels = input_ids.clone()
-        labels[:-answer_len] = -100  # only keep loss on answer
-
-        # Ensure EOS token is at the end of the sequence
-        if input_ids[-1] != self.processor.tokenizer.eos_token_id:
-            input_ids = torch.cat([input_ids, torch.tensor([self.processor.tokenizer.eos_token_id])])
-            attention_mask = torch.cat([attention_mask, torch.tensor([1])])
-            labels = torch.cat([labels, torch.tensor([self.processor.tokenizer.eos_token_id])])
-
+        labels[:prompt_len] = -100  # Mask prompt (including image tokens)
+        
         return {
             "input_ids": input_ids.long(),
             "attention_mask": attention_mask.long(),
@@ -123,7 +129,7 @@ def train(
     data_dir: Path | None = None,
     train_dataset_name: str = "train",
     output_dir: str = "vlm_sft",
-    num_train_epochs: int = 0.05,  # use only 0.05 epoch for training
+    num_train_epochs: float = 0.05,  # Changed to float for fractional epochs
     per_device_train_batch_size: int = 8,
     gradient_accumulation_steps: int = 4,
     learning_rate: float = 5e-4,
@@ -132,21 +138,6 @@ def train(
     lora_dropout: float = 0.0,
     num_workers: int = 16,
 ):
-    """
-    Fine-tune a VLM model using LoRA.
-
-    Args:
-        model_name: Name of the base model to fine-tune
-        data_dir: Directory containing the dataset
-        output_dir: Directory to save the fine-tuned model
-        num_train_epochs: Number of training epochs
-        per_device_train_batch_size: Batch size per device
-        gradient_accumulation_steps: Number of gradient accumulation steps
-        learning_rate: Learning rate
-        lora_r: LoRA rank
-        lora_alpha: LoRA alpha
-        lora_dropout: LoRA dropout
-    """
     vlm = BaseVLM()
 
     # Create output directory
@@ -161,6 +152,10 @@ def train(
     # Initialize model and processor
     processor = vlm.processor
     model = vlm.model
+
+    # Ensure pad token is set
+    if processor.tokenizer.pad_token is None:
+        processor.tokenizer.pad_token = processor.tokenizer.eos_token
 
     # Configure LoRA
     peft_config = LoraConfig(
@@ -178,15 +173,16 @@ def train(
     model.print_trainable_parameters()
     model.config.use_cache = False
     model.enable_input_require_grads()
+    
+    # Enable gradient checkpointing BEFORE setting to train mode
+    if hasattr(model, 'gradient_checkpointing_enable'):
+        model.gradient_checkpointing_enable()
+    
     model.train()
 
     # Prepare datasets
     train_dataset = VQADataset(train_dataset_name, data_dir)
-
     train_dataset = VQADatasetForTraining(train_dataset, processor)
-
-    if processor.tokenizer.pad_token is None:
-        processor.tokenizer.pad_token = processor.tokenizer.eos_token
 
     # Configure training arguments
     training_args = TrainingArguments(
@@ -196,6 +192,7 @@ def train(
         num_train_epochs=num_train_epochs,
         per_device_train_batch_size=per_device_train_batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
+        gradient_checkpointing=True,
         learning_rate=learning_rate,
         bf16=True if DEVICE == "cuda" else False,
         logging_steps=1,
@@ -204,7 +201,9 @@ def train(
         save_total_limit=2,
         label_names=["labels"],
         dataloader_num_workers=num_workers,
-    )
+        remove_unused_columns=False,  # ADD THIS LINE
+        dataloader_pin_memory=True if DEVICE == "cuda" else False,
+)
 
     # Initialize trainer
     trainer = Trainer(
@@ -266,12 +265,21 @@ def demo_train():
 
 
 def test_model(ckpt_path: str, val_dataset: str = "valid_grader"):
-    testset = VQADataset(val_dataset)
-
-    llm = load(ckpt_path)
-
-    benchmark_result = benchmark(llm, testset, 128)
-    print(benchmark_result.accuracy)
+    try:
+        testset = VQADataset(val_dataset)
+        llm = load(ckpt_path)
+        
+        # Ensure model is in eval mode and on correct device
+        llm.model.eval()
+        
+        benchmark_result = benchmark(llm, testset, 128)
+        print(f"Accuracy: {benchmark_result.accuracy}")
+        return benchmark_result.accuracy
+    except Exception as e:
+        print(f"Error during testing: {e}")
+        import traceback
+        traceback.print_exc()
+        return 0.0
 
 
 if __name__ == "__main__":
