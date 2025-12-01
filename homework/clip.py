@@ -1,4 +1,5 @@
 from pathlib import Path
+import random
 from typing import Any
 
 import torch
@@ -12,6 +13,37 @@ from transformers import AutoProcessor, Trainer, TrainingArguments
 
 from .base_vlm import BaseVLM
 from .data import CaptionDataset, MultiChoiceQADataset
+
+from transformers import AutoProcessor, Trainer, TrainingArguments
+from transformers.trainer_callback import TrainerCallback
+
+from .base_vlm import BaseVLM
+from .data import CaptionDataset, MultiChoiceQADataset
+
+processor = AutoProcessor.from_pretrained("HuggingFaceTB/SmolVLM-256M-Instruct")
+
+device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+
+
+class SaveAdditionalWeightsCallback(TrainerCallback):
+    """Callback to save additional_weights.pt at the end of training."""
+    def __init__(self, output_dir):
+        self.output_dir = output_dir
+    
+    def on_train_end(self, args, state, control, **kwargs):
+        # Save additional weights from the CLIP model
+        model = kwargs.get('model')
+        if model is not None:
+            if hasattr(model, 'module'):
+                # Wrapped model
+                clip_model = model.module
+            else:
+                # Direct PEFT model
+                clip_model = model.model if hasattr(model, 'model') else model
+            
+            # Call save_pretrained on the CLIP model
+            if hasattr(clip_model, 'save_pretrained'):
+                clip_model.save_pretrained(self.output_dir)
 
 processor = AutoProcessor.from_pretrained("HuggingFaceTB/SmolVLM-256M-Instruct")
 
@@ -33,35 +65,21 @@ def load(model_name: str = "clip_model"):
     if model_path.exists() and adapter_config.exists():
         try:
             clip = PeftModel.from_pretrained(clip_net, model_path)
-            # load additional projection weights if present
             try:
                 clip.model.load_pretrained(model_path)
             except Exception:
                 pass
             
-            # CRITICAL: Move to device AFTER loading weights
             clip = clip.to(device)
             clip.model.eval()
             if device == "cuda":
                 clip = clip.to(dtype=torch.bfloat16)
             return clip
         except Exception:
-            pass
+            raise RuntimeError(f"Failed to load PEFT adapter from {model_path}")
 
-    # No adapter available: return a simple wrapper
-    class _SimpleWrapper:
-        def __init__(self, model):
-            self.model = model
-
-    clip_net = clip_net.to(device)
-    clip_net.eval()
-    if device == "cuda":
-        try:
-            clip_net = clip_net.to(dtype=torch.bfloat16)
-        except Exception:
-            pass
-
-    return _SimpleWrapper(clip_net)
+    # If adapter config is missing, raise instead of returning simple wrapper
+    raise FileNotFoundError(f"No adapter found at {model_path}. Train first before testing.")
 
 
 def clip_data_collator(features: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
@@ -100,6 +118,16 @@ class CaptionDatasetForTraining(Dataset):
         )
         self.processor = processor
 
+    # Add this to your CaptionDatasetForTraining class
+    def split_caption_into_fragments(self, caption):
+        """Split a full caption into individual fragments"""
+        # Split by ". " to get sentences
+        fragments = caption.split(". ")
+        # Clean up and add periods back
+        fragments = [f.strip() + "." if not f.endswith(".") else f.strip() 
+                    for f in fragments if f.strip()]
+        return fragments
+
     def __len__(self):
         return len(self.dataset)
 
@@ -107,7 +135,16 @@ class CaptionDatasetForTraining(Dataset):
         item = self.dataset[idx]
         image = Image.open(item["image_path"]).convert("RGB")
         pixel_values = self.image_processor(image)
-        text = item["caption"] + self.processor.tokenizer.eos_token
+        
+        # NEW: Split caption and randomly select one fragment
+        fragments = self.split_caption_into_fragments(item["caption"])
+        if fragments:
+            text = random.choice(fragments)
+        else:
+            text = item["caption"]  # Fallback to full caption
+        
+        text = text + self.processor.tokenizer.eos_token
+
         text_inputs = self.processor(text=text, return_tensors="pt", padding=True, truncation=True)
         input_ids = text_inputs["input_ids"].squeeze(0).long()
         attention_mask = text_inputs["attention_mask"].squeeze(0)
@@ -345,10 +382,10 @@ def get_target_modules_for_lora(model: nn.Module) -> list[str]:
 def train(
     data_dir: Path | None = None,
     output_dir: str = "clip_model",
-    num_train_epochs: float = 0.05,  # for debugging purpose, increase this once the dry run works
-    per_device_train_batch_size: int = 1024,
+    num_train_epochs: float = 1,
+    per_device_train_batch_size: int = 256,
     gradient_accumulation_steps: int = 1,
-    learning_rate: float = 5e-4,
+    learning_rate: float = 1e-4,  # Adjust if stuck in local minima (try 5e-4, 1e-3)
     num_workers: int = 16,
 ):
     vlm = BaseVLM()
@@ -365,7 +402,6 @@ def train(
     vision_encoder = vlm.model.model.vision_model
     text_encoder = vlm.model.model.text_model
     model = CLIP(vision_encoder, text_encoder).to(device).bfloat16()
-    model.set_trainable_parameters()
 
     peft_config = LoraConfig(
         task_type=TaskType.FEATURE_EXTRACTION,
@@ -373,11 +409,15 @@ def train(
         r=8,
         lora_alpha=32,
         lora_dropout=0.0,
-        # target_modules="all-linear",
         target_modules=get_target_modules_for_lora(model),
         bias="none",
     )
     model = get_peft_model(model, peft_config)
+    
+    # CRITICAL: Set trainable parameters AFTER get_peft_model
+    # This ensures projection layers (_vision_proj, _text_proj, log_temp) are trainable
+    model.set_trainable_parameters()
+    
     model.print_trainable_parameters()
     model.to(device)
     model.train()
@@ -398,10 +438,9 @@ def train(
         gradient_checkpointing=True,
         learning_rate=learning_rate,
         bf16=True if device == "cuda" else False,
-        logging_steps=1,
-        save_strategy="steps",
-        save_steps=50,
-        save_total_limit=2,
+        logging_steps=10,
+        save_strategy="epoch",
+        save_total_limit=1,
         label_names=["labels"],
         dataloader_num_workers=num_workers,
     )
@@ -412,14 +451,14 @@ def train(
         train_dataset=train_dataset,
         data_collator=clip_data_collator,
         compute_loss_func=compute_clip_loss,
+        callbacks=[SaveAdditionalWeightsCallback(output_dir)],
     )
 
-    trainer.train()
+    trainer.train(resume_from_checkpoint=True)
 
-    # save model
+    # Save the PEFT adapter
     trainer.save_model(output_dir)
-    model.model.save_pretrained(output_dir)
-
+    
     writer.close()
 
     return model, processor
@@ -443,7 +482,8 @@ def test(ckpt_path: str, val_dataset: str = "valid_grader"):
     testset = MultiChoiceQADataset(val_dataset)
 
     clip = load(ckpt_path)
-    clip = clip.model.to(device)
+    clip = clip.to(device)
+    clip.eval()
 
     image_processor = tv.transforms.Compose([
         tv.transforms.Resize(192),
@@ -457,10 +497,12 @@ def test(ckpt_path: str, val_dataset: str = "valid_grader"):
 
     for pair in tqdm.tqdm(testset):
         image = Image.open(pair["image_path"]).convert("RGB")
-        pixel_values = image_processor(image).unsqueeze(0).to(device)
+        pixel_values = image_processor(image).unsqueeze(0).to(device)  # (1, 3, 192, 192)
+        # Convert to model dtype
+        target_dtype = next(clip.model.vision_encoder.parameters()).dtype
+        pixel_values = pixel_values.to(dtype=target_dtype)
         
-        # Don't manually convert dtype - let the model's forward() handle it
-        
+        # Encode each candidate text
         text_inputs = processor(
             text=[s + processor.tokenizer.eos_token for s in pair["candidates"]],
             return_tensors="pt",
@@ -470,14 +512,22 @@ def test(ckpt_path: str, val_dataset: str = "valid_grader"):
         input_ids = text_inputs["input_ids"].long().to(device)
         attention_mask = text_inputs["attention_mask"].to(device)
         
-        vision_feature, text_feature, _ = clip(pixel_values, input_ids, attention_mask)
-        prediction = torch.matmul(vision_feature, text_feature.T).argmax(dim=-1)
+        with torch.no_grad():
+            # Use model forward to ensure projections are initialized
+            _, _, logits = clip(
+                pixel_values=pixel_values,
+                input_ids=input_ids,
+                attention_mask=attention_mask
+            )
+            # logits shape is (1, num_candidates) - similarities between image and each text
+        
+        prediction = logits.argmax(dim=-1).item()
         
         if prediction == pair["correct_index"]:
             correct_count += 1
         total_count += 1
 
-    print(f"Accuracy: {correct_count / total_count}")
+    print(f"\nAccuracy: {correct_count / total_count:.4f}")
 
 def main():
     from fire import Fire

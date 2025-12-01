@@ -52,7 +52,7 @@ def generate_caption(info_path: str, view_index: int, img_width: int = 150, img_
                 continue
             x, y = k["center"]
             lr = "left" if x < ex else "right"
-            fb = "front" if y < ey else "behind"
+            fb = "in front" if y < ey else "back"
             captions.append(f"{k['kart_name']} is {fb} and to the {lr} of the ego car.")
             added += 1
             if added >= 3:

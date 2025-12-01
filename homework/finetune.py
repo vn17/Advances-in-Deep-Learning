@@ -195,12 +195,13 @@ def train(
         gradient_checkpointing=True,
         learning_rate=learning_rate,
         bf16=True if DEVICE == "cuda" else False,
-        logging_steps=1,
+        logging_steps=10,
         save_strategy="steps",
-        save_steps=50,
+        save_steps=500,
         save_total_limit=2,
         label_names=["labels"],
         dataloader_num_workers=num_workers,
+        dataloader_persistent_workers=True,
         remove_unused_columns=False,  # ADD THIS LINE
         dataloader_pin_memory=True if DEVICE == "cuda" else False,
 )
