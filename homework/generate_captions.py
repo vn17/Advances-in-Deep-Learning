@@ -10,19 +10,6 @@ def generate_caption(info_path: str, view_index: int, img_width: int = 150, img_
     """
     Generate caption for a specific view.
     """
-    # 1. Ego car
-    # {kart_name} is the ego car.
-
-    # 2. Counting
-    # There are {num_karts} karts in the scenario.
-
-    # 3. Track name
-    # The track is {track_name}.
-
-    # 4. Relative position
-    # {kart_name} is {position} of the ego car.
-
-    # Reuse helpers from generate_qa
     from generate_qa import extract_kart_objects, extract_track_info
 
     karts = extract_kart_objects(info_path, view_index, img_width, img_height)
@@ -82,9 +69,11 @@ def check_caption(info_file: str, view_index: int):
     plt.title(f"Frame {extract_frame_info(str(image_file))[0]}, View {view_index}")
     plt.show()
 
+
 def generate(data_dir: str, output_file: str = None, num_views: int = 10):
     """
     Generate captions for all info files in a directory.
+    Each caption fragment is stored individually (using extend).
     
     Args:
         data_dir: Directory containing *_info.json files
@@ -93,25 +82,25 @@ def generate(data_dir: str, output_file: str = None, num_views: int = 10):
     """
     from tqdm import tqdm
     import json
-    
+
     data_dir = Path(data_dir)
-    
+
     if output_file is None:
         output_file = data_dir / "balanced_captions.json"
     else:
         output_file = Path(output_file)
-    
+
     # Find all info files
     info_files = sorted(data_dir.glob("*_info.json"))
-    
+
     if len(info_files) == 0:
         print(f"❌ No *_info.json files found in {data_dir}")
         return
-    
+
     print(f"📁 Found {len(info_files)} info files in {data_dir}")
-    
+
     all_captions = []
-    
+
     # Process each info file and each view
     for info_file in tqdm(info_files, desc="Generating captions"):
         try:
@@ -119,54 +108,42 @@ def generate(data_dir: str, output_file: str = None, num_views: int = 10):
             with open(info_file) as f:
                 info_data = json.load(f)
             actual_num_views = len(info_data.get("detections", []))
-            
+
             for view_idx in range(min(num_views, actual_num_views)):
                 # Check if image exists for this view
                 base_name = info_file.stem.replace("_info", "")
                 image_file = info_file.parent / f"{base_name}_{view_idx:02d}_im.jpg"
-                
+
                 if not image_file.exists():
                     continue
-                
+
                 # Generate captions for this view
                 captions = generate_caption(str(info_file), view_idx)
-                
-                # Combine into a single caption
-                combined_caption = " ".join(captions)
-                
-                # Store with image path
-                info_path_obj = Path(info_file)
-                image_name = f"{base_name}_{view_idx:02d}_im.jpg"
-                
-                all_captions.append({
-                    "image_file": str(Path(info_path_obj.parent.name) / image_name),
-                    "caption": combined_caption
-                })
-                
+
+                # Store each caption separately
+                for caption in captions:
+                    all_captions.append({
+                        "image_file": str(Path(info_file.parent.name) / image_file.name),
+                        "caption": caption
+                    })
+
         except Exception as e:
             print(f"\n⚠️  Error processing {info_file.name}: {e}")
             continue
-    
+
     # Save to JSON
     output_file.parent.mkdir(parents=True, exist_ok=True)
     with open(output_file, 'w') as f:
         json.dump(all_captions, f, indent=2)
-    
+
     print(f"\n✅ Generated {len(all_captions)} captions")
     print(f"📝 Saved to: {output_file}")
     print(f"\n📊 Statistics:")
     print(f"   - Info files processed: {len(info_files)}")
     print(f"   - Total captions: {len(all_captions)}")
     print(f"   - Avg captions per file: {len(all_captions) / len(info_files):.1f}")
-    
+
     return all_captions
-
-"""
-Usage Example: Visualize QA pairs for a specific file and view:
-   python generate_captions.py check --info_file ../data/valid/00000_info.json --view_index 0
-
-You probably need to add additional commands to Fire below.
-"""
 
 
 def main():

@@ -368,7 +368,7 @@ def generate_qa_pairs(info_path: str, view_index: int, img_width: int = 150, img
             # left/right by x coordinate
             if x < ex:
                 lr = "left"
-                left_count += 1
+                left_count += 1 
             else:
                 lr = "right"
                 right_count += 1
